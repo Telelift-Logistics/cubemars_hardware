@@ -157,7 +157,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       if(std::stoi(joint.parameters.at("bypass_calibration")) == 1){
         msg.is_calibrated = true;
       } else{
-        msg.calibrate = true;
+        msg.is_calibrated = false;
       }
     }
     motor_msgs_.emplace_back(msg);
@@ -166,14 +166,22 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   // Enable control server
   node_ = std::make_shared<rclcpp::Node>("lift_platform_node");
   motor_srvr_ = node_->create_service<MotorControlService>(
-    "~/liftplatform_hardware",
+    "lift_platform_hardware",
     std::bind(&CubeMarsSystemHardware::motor_control_callback, this,
     std::placeholders::_1, std::placeholders::_2)
   );
 
+  // Setup GPIO subscriber
+  // sub_gpio_states_ = node_->create_subscription<ControlMessage>(
+  //   TOPIC_GPIO_STATES,
+  //   rclcpp::SystemDefaultsQoS(),
+  //   std::bind(&LEDMatrixControllerNode::gpio_states_callback, this, std::placeholders::_1),
+  //   sub_options
+  // );
+
   // Setup the realtime publisher
   s_publisher_ = get_node()->create_publisher<MotorCommandGrp>(
-    "~/liftplatform_status", rclcpp::SystemDefaultsQoS());
+    "lift_platform_status", rclcpp::SystemDefaultsQoS());
   state_publisher_ =
     std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
   
@@ -431,11 +439,22 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
         RCLCPP_INFO(
           rclcpp::get_logger("CubeMarsSystemHardware"),
           "Position has reached maximum possible value.");
+        if(is_calibration_running_ && (calibration_phase_[i] == CalibrationPhase::FIND_ROOT))
+        {
+          RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Switcing phase to midsection find ");
+          //stop operation
+          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+          //set virtual zero - bottom
+          can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
+          // change calibration phase
+          calibration_phase_[i] = zero_at_midpoint_[i] ? CalibrationPhase::FIND_MIDSECTION : CalibrationPhase::INIT;
+        }
       }
       hw_states_positions_[i] = pos_int;
       hw_states_velocities_[i] = std::int16_t (read_data[2] << 8 | read_data[3]);
       hw_states_efforts_[i] = std::int16_t (read_data[4] << 8 | read_data[5]);
-
+      hw_states_temperatures_[i] = read_data[6];
     }
   }
 
@@ -459,7 +478,7 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       hw_states_velocities_[i] = hw_states_velocities_[i] * 10 / erpm_conversions_[i];
       hw_states_efforts_[i] = hw_states_efforts_[i] * 0.01 * torque_constants_[i] *
         std::stoi(info_.joints[i].parameters.at("gear_ratio"));
-      hw_states_temperatures_[i] = read_data[6];
+      
       if (trq_limits_[i] != 0 && hw_states_efforts_[i] > trq_limits_[i])
       {
         if(is_calibration_running_)
@@ -645,11 +664,19 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         {
           if (!std::isnan(hw_commands_positions_[i]))
           {
-            double input_cmd = hw_commands_positions_[i];
+            double input_cmd = (is_calibration_running_ && motor_msgs_[i].calibrate) ? 
+              hw_states_positions_[i] : hw_commands_positions_[i];
 
-            if(use_meters_){ //convert meters to centimeters
-              input_cmd *= 100.0;
+            //Clamp command to specified hardware limits
+            if(motor_msgs_[i].is_calibrated){
+              if(input_cmd < 0.0) input_cmd = 0.0;
+              if(input_cmd > hardware_limits_[i].range) input_cmd = hardware_limits_[i].range;
+            } else {
+              if(input_cmd < -hardware_limits_[i].range) input_cmd = -hardware_limits_[i].range;
+              if(input_cmd > hardware_limits_[i].range) input_cmd = hardware_limits_[i].range;
             }
+
+            if(use_meters_) input_cmd *= 100.0;
 
             if(is_calibration_running_ && motor_msgs_[i].calibrate)
             { // Calibration logic goes here
@@ -657,8 +684,9 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
               {
                 case CalibrationPhase::FIND_ROOT:
                 {
-                  input_cmd = hw_states_positions_[i];
-                  if(use_meters_) input_cmd *= 100.0;
+                  RCLCPP_INFO(
+                    rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Finding ROOT, command: %f", input_cmd);
                   // Check direction of bottom
                   if(mount_dir_[i]) input_cmd -= CALIBRATIONSTEP;
                   else input_cmd += CALIBRATIONSTEP;
@@ -666,12 +694,12 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
                 }
                 case CalibrationPhase::FIND_MIDSECTION:
                 {
+                  RCLCPP_INFO(
+                    rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Going to MIDSECTION");
                   input_cmd = hardware_limits_[i].range * 0.5;
                   double cur_state = hw_states_positions_[i];
-                  if(use_meters_) {
-                    input_cmd *= 100.0;
-                    cur_state *= 100.0;
-                  }
+
                   //check if at mid-section
                   if(std::abs(input_cmd - cur_state) < CALIBRATIONTHRESHOLD)
                   {
@@ -682,6 +710,9 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
                 }
                 case CalibrationPhase::SET_VIRTUAL_ZERO:
                 {
+                  RCLCPP_INFO(
+                    rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Setting Virtual Zero");
                   //set virtual zero - midpoint
                   can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
                   // change calibration phase
@@ -691,17 +722,17 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
                 }
                 case CalibrationPhase::INIT:
                 { // send lift to the virtual lower position
+                  RCLCPP_INFO(
+                    rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Setting INIT and OFFSETS");
                   if(zero_at_midpoint_[i])
                   {
                     double midpoint = hardware_limits_[i].range * 0.5;
                     input_cmd = (mount_dir_[i]) ? -midpoint : midpoint;
                     double cur_state = hw_states_positions_[i];
-                    if(use_meters_) {
-                      input_cmd *= 100.0;
-                      cur_state *= 100.0;
-                    }
+
                     //check if at virtual lower section (bottom)
-                    if((std::abs(input_cmd) - std::abs(cur_state)) >= (std::abs(input_cmd) - CALIBRATIONTHRESHOLD))
+                    if (std::abs(input_cmd - cur_state) < CALIBRATIONTHRESHOLD)
                     {
                       enc_offs_[i] = (mount_dir_[i]) ? -midpoint : midpoint; //set motor offset
                       motor_msgs_[i].is_calibrated = true;
@@ -731,13 +762,6 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
               can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
               motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
               return hardware_interface::return_type::OK;
-            }
-
-            //Clamp command to specified hardware limits
-            if(!motor_msgs_[i].is_calibrated){
-              input_cmd = std::clamp(input_cmd, 0., hardware_limits_[i].range);
-            } else {
-              input_cmd = std::clamp(input_cmd, -hardware_limits_[i].range, hardware_limits_[i].range);
             }
 
             std::int32_t position = (input_cmd + enc_offs_[i]) * 10000 * 180 / M_PI;
@@ -807,7 +831,7 @@ void CubeMarsSystemHardware::motor_control_callback(
 {
   if(has_request_ || is_calibration_running_ || is_changing_state_)
   {
-    response->status = true;
+    response->success = true;
     response->message = is_calibration_running_ ? "Calibration in progress" : 
       "Motor State change in progress";
     return;
@@ -817,7 +841,7 @@ void CubeMarsSystemHardware::motor_control_callback(
     {
       if(request->commands.size() > info_.joints.size())
       {
-        response->status = false;
+        response->success = false;
         response->message = "Invalid Request";
         return;
       }
@@ -841,7 +865,7 @@ void CubeMarsSystemHardware::motor_control_callback(
         { // can't process two different actions at once
           calibration_phase_[i] = CalibrationPhase::DEFAULT;
           has_request_.store(false);
-          response->status = false;
+          response->success = false;
           response->message = "Invalid Action Request";
           return;
         }
@@ -851,13 +875,13 @@ void CubeMarsSystemHardware::motor_control_callback(
         command_mailbox_.set(request->commands); // set mailbox
         has_request_.store(true);
 
-        response->status = true;
+        response->success = true;
         response->message = trigger_calibration ? "Starting calibration" : "Changing motor state";
         return;
       }
       
       {
-        response->status = false;
+        response->success = false;
         response->message = "Unknown Request";
         return;
       }
