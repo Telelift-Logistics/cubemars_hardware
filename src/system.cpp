@@ -175,7 +175,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   // sub_gpio_states_ = node_->create_subscription<ControlMessage>(
   //   TOPIC_GPIO_STATES,
   //   rclcpp::SystemDefaultsQoS(),
-  //   std::bind(&LEDMatrixControllerNode::gpio_states_callback, this, std::placeholders::_1),
+  //   std::bind(&CubeMarsSystemHardware::process_gpio_message, this, std::placeholders::_1),
   //   sub_options
   // );
 
