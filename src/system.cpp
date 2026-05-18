@@ -1,6 +1,10 @@
 #include "cubemars_hardware/system.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
+#include <unordered_set>
 #include <vector>
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
@@ -8,6 +12,58 @@
 
 namespace cubemars_hardware
 {
+
+namespace {
+// Local helpers --------------------------------------------------------------
+
+/// @brief Pull a hardware parameter by name as int, with a default.
+int get_hw_param_int(
+  const hardware_interface::HardwareInfo & info, const std::string & key, int def)
+{
+  auto it = info.hardware_parameters.find(key);
+  if (it == info.hardware_parameters.end()) return def;
+  try { return std::stoi(it->second); } catch (...) { return def; }
+}
+
+/// @brief Pull a hardware parameter by name as string, with a default.
+std::string get_hw_param_str(
+  const hardware_interface::HardwareInfo & info, const std::string & key,
+  const std::string & def)
+{
+  auto it = info.hardware_parameters.find(key);
+  return (it != info.hardware_parameters.end()) ? it->second : def;
+}
+
+/// @brief Pull a per-joint parameter as double, with a default.
+double get_joint_param_double(
+  const hardware_interface::ComponentInfo & joint, const std::string & key, double def)
+{
+  auto it = joint.parameters.find(key);
+  if (it == joint.parameters.end()) return def;
+  try { return std::stod(it->second); } catch (...) { return def; }
+}
+
+/// @brief Pull a per-joint parameter as int, with a default.
+int get_joint_param_int(
+  const hardware_interface::ComponentInfo & joint, const std::string & key, int def)
+{
+  auto it = joint.parameters.find(key);
+  if (it == joint.parameters.end()) return def;
+  try { return std::stoi(it->second); } catch (...) { return def; }
+}
+
+/// @brief Pull a per-joint parameter as string, with a default.
+std::string get_joint_param_str(
+  const hardware_interface::ComponentInfo & joint, const std::string & key,
+  const std::string & def)
+{
+  auto it = joint.parameters.find(key);
+  return (it != joint.parameters.end()) ? it->second : def;
+}
+
+}  // namespace
+
+
 CubeMarsSystemHardware::~CubeMarsSystemHardware()
 {
   // If the controller manager is shutdown via Ctrl + C
@@ -15,16 +71,15 @@ CubeMarsSystemHardware::~CubeMarsSystemHardware()
 }
 
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
-  const hardware_interface::HardwareInfo & info)
+  const hardware_interface::HardwareComponentInterfaceParams & params)
 {
-  if (
-    hardware_interface::SystemInterface::on_init(info) !=
-    hardware_interface::CallbackReturn::SUCCESS)
+  if (hardware_interface::SystemInterface::on_init(params) !=
+      hardware_interface::CallbackReturn::SUCCESS)
   {
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  // Get main interface parameters
+  // -------------------- hardware-level parameters --------------------
   if (info_.hardware_parameters.count("can_interface") != 0) {
     can_itf_ = info_.hardware_parameters.at("can_interface");
   } else {
@@ -33,71 +88,37 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       "No can_interface specified in URDF");
     return hardware_interface::CallbackReturn::ERROR;
   }
-  if (info_.hardware_parameters.count("use_meters") !=0 &&
-    std::stoi(info_.hardware_parameters.at("use_meters")) == 1) {
-    use_meters_ = true;
-  }
-  if (info_.hardware_parameters.count("use_limit_sensor") !=0 &&
-    std::stoi(info_.hardware_parameters.at("use_limit_sensor")) == 1) {
-    use_limit_sensor_ = true;
-  }
-  if (info_.hardware_parameters.count("auto_calibrate") !=0 &&
-    std::stoi(info_.hardware_parameters.at("auto_calibrate")) == 1) {
-    has_request_.store(true);
-  }
 
-  hw_states_positions_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_states_velocities_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_states_efforts_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_states_temperatures_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_commands_positions_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_commands_velocities_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_commands_accelerations_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  hw_commands_efforts_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
-  control_mode_.resize(info_.joints.size(), control_mode_t::UNDEFINED);
-  calibration_phase_.resize(info_.joints.size(), CalibrationPhase::DEFAULT);
+  use_meters_       = (get_hw_param_int(info_, "use_meters", 0) == 1);
+  use_limit_sensor_ = (get_hw_param_int(info_, "use_limit_sensor", 0) == 1);
+  global_cfg_.auto_calibrate_on_activate =
+    (get_hw_param_int(info_, "auto_calibrate", 0) == 1);
+  global_cfg_.gpio_states_topic =
+    get_hw_param_str(info_, "gpio_states_topic", "gpio_states");
+  global_cfg_.encoder_overflow_threshold =
+    static_cast<std::int16_t>(get_hw_param_int(info_, "encoder_overflow_threshold", 32000));
 
-  for (const hardware_interface::ComponentInfo & joint : info_.joints)
-  {
-    if (joint.parameters.count("can_id") != 0 &&
-      joint.parameters.count("kt") != 0 &&
-      joint.parameters.count("pole_pairs") != 0 &&
-      joint.parameters.count("gear_ratio") != 0)
-    {
-      can_ids_.emplace_back(std::stoul(joint.parameters.at("can_id")));
-      torque_constants_.emplace_back(std::stod(joint.parameters.at("kt")));
-      double erpm_conversion = std::stoi(joint.parameters.at("pole_pairs")) * 
-        std::stoi(joint.parameters.at("gear_ratio")) * 60 / (2 * M_PI);
-      erpm_conversions_.emplace_back(erpm_conversion);
+  // -------------------- resize per-joint vectors --------------------
+  const std::size_t n = info_.joints.size();
+  hw_states_positions_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_states_velocities_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_states_efforts_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_states_temperatures_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_commands_positions_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_commands_velocities_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_commands_accelerations_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  hw_commands_efforts_.assign(n, std::numeric_limits<double>::quiet_NaN());
+  control_mode_.assign(n, control_mode_t::UNDEFINED);
+  calibration_cfg_.assign(n, CalibrationConfig{});
+  calibration_rt_.assign(n, CalibrationRuntime{});
 
-      if (joint.parameters.count("acc_limit") != 0 &&
-        joint.parameters.count("vel_limit") != 0)
-      {
-        std::pair<std::int32_t, std::int32_t> limits;
-        limits.first = std::stoi(joint.parameters.at("vel_limit")) / 10 * erpm_conversion;
-        limits.second = std::stoi(joint.parameters.at("acc_limit")) / 10 * erpm_conversion;
-        if (limits.first >= 32767 || limits.first <= 0)
-        {
-          RCLCPP_ERROR(
-            rclcpp::get_logger("CubeMarsSystemHardware"),
-            "velocity limit is not in range 0-32767: %d", limits.first);
-          return hardware_interface::CallbackReturn::ERROR;
-        }
-        if (limits.second >= 32767 || limits.second <= 0)
-        {
-          RCLCPP_ERROR(
-            rclcpp::get_logger("CubeMarsSystemHardware"),
-            "acceleration limit is not in range 0-32767: %d", limits.second);
-          return hardware_interface::CallbackReturn::ERROR;
-        }
-        limits_.emplace_back(limits);
-      }
-      else
-      {
-        limits_.emplace_back(std::make_pair(0, 0));
-      }
-    }
-    else
+  // -------------------- per-joint parameters --------------------
+  for (const hardware_interface::ComponentInfo & joint : info_.joints) {
+    // Required motor parameters
+    if (joint.parameters.count("can_id") == 0 ||
+        joint.parameters.count("kt") == 0 ||
+        joint.parameters.count("pole_pairs") == 0 ||
+        joint.parameters.count("gear_ratio") == 0)
     {
       RCLCPP_FATAL(
         rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -105,90 +126,171 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       return hardware_interface::CallbackReturn::ERROR;
     }
 
-    if (joint.parameters.count("enc_off") != 0)
+    can_ids_.emplace_back(std::stoul(joint.parameters.at("can_id")));
+    torque_constants_.emplace_back(std::stod(joint.parameters.at("kt")));
+    const double erpm_conversion =
+      std::stoi(joint.parameters.at("pole_pairs")) *
+      std::stoi(joint.parameters.at("gear_ratio")) * 60.0 / (2.0 * M_PI);
+    erpm_conversions_.emplace_back(erpm_conversion);
+
+    // (vel, acc) limits for POSITION_SPEED_LOOP
+    if (joint.parameters.count("acc_limit") != 0 &&
+        joint.parameters.count("vel_limit") != 0)
     {
-      enc_offs_.emplace_back(std::stod(joint.parameters.at("enc_off")));
-    }
-    else
-    {
-      enc_offs_.emplace_back(0);
-    }
-
-    if (joint.parameters.count("trq_limit") != 0 && std::stod(joint.parameters.at("trq_limit")) > 0)
-    {
-      trq_limits_.emplace_back(std::stod(joint.parameters.at("trq_limit")));
-    }
-    else
-    {
-      trq_limits_.emplace_back(0);
-    }
-
-    if (joint.parameters.count("read_only") != 0 && std::stoi(joint.parameters.at("read_only")) == 1){
-      read_only_.emplace_back(true);
-    }else{
-      read_only_.emplace_back(false);
+      std::pair<std::int32_t, std::int32_t> limits;
+      limits.first  = std::stoi(joint.parameters.at("vel_limit")) / 10 * erpm_conversion;
+      limits.second = std::stoi(joint.parameters.at("acc_limit")) / 10 * erpm_conversion;
+      if (limits.first >= 32767 || limits.first <= 0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "velocity limit is not in range 0-32767: %d", limits.first);
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      if (limits.second >= 32767 || limits.second <= 0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "acceleration limit is not in range 0-32767: %d", limits.second);
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      limits_.emplace_back(limits);
+    } else {
+      limits_.emplace_back(std::make_pair(0, 0));
     }
 
-    //fetch joint limits -- ONLY ENFORCED IN POSITION SPEED LOOP MODE
-    JointLimits limits;
-    if(joint.parameters.count("max_range") != 0 && std::stod(joint.parameters.at("max_range")) > 0){
-      limits.range = std::stod(joint.parameters.at("max_range"));
-    }else {
-      limits.range = 0.0;
-    }
-    hardware_limits_.push_back(limits);
+    enc_offs_.emplace_back(get_joint_param_double(joint, "enc_off", 0.0));
+    trq_limits_.emplace_back(std::max(0.0, get_joint_param_double(joint, "trq_limit", 0.0)));
+    read_only_.emplace_back(get_joint_param_int(joint, "read_only", 0) == 1);
 
-    if (joint.parameters.count("mount_dir") != 0 && std::stoi(joint.parameters.at("mount_dir")) == 1){
-      mount_dir_.emplace_back(false);
-    } else{
-      mount_dir_.emplace_back(true);
-    }
+    JointLimits jl;
+    jl.range = std::max(0.0, get_joint_param_double(joint, "max_range", 0.0));
+    hardware_limits_.push_back(jl);
 
-    if (joint.parameters.count("zero_at_midpoint") != 0 && std::stoi(joint.parameters.at("zero_at_midpoint")) == 1){
-      zero_at_midpoint_.emplace_back(true);
-    } else{
-      zero_at_midpoint_.emplace_back(false);
-    }
+    // mount_dir: param value 1 means "up is -ve in raw encoder frame"
+    mount_dir_.emplace_back(get_joint_param_int(joint, "mount_dir", 0) != 1);
+    zero_at_midpoint_.emplace_back(get_joint_param_int(joint, "zero_at_midpoint", 0) == 1);
 
-    // prepare motor message publisher
-    MotorCommandMsg msg;
-    msg.can_id = static_cast<uint8_t>(std::stoul(joint.parameters.at("can_id")));
-    if (joint.parameters.count("bypass_calibration") != 0){
-      if(std::stoi(joint.parameters.at("bypass_calibration")) == 1){
-        msg.is_calibrated = true;
-      } else{
-        msg.is_calibrated = false;
+    // ---- Calibration config (per joint) ----
+    CalibrationConfig & cfg = calibration_cfg_.back();
+    cfg = CalibrationConfig{};  // defaults already initialized in struct
+
+    const bool bypass = (get_joint_param_int(joint, "bypass_calibration", 0) == 1);
+    cfg.enabled = !bypass && (jl.range > 0.0);
+
+    cfg.search_step =
+      get_joint_param_double(joint, "calibration_search_step", cfg.search_step);
+    cfg.position_tolerance =
+      get_joint_param_double(joint, "calibration_position_tolerance",
+                             cfg.position_tolerance);
+    cfg.stall_torque =
+      get_joint_param_double(joint, "calibration_stall_torque", cfg.stall_torque);
+
+    cfg.step_period = std::chrono::milliseconds(
+      get_joint_param_int(joint, "calibration_step_period_ms",
+                          static_cast<int>(cfg.step_period.count())));
+    cfg.phase_timeout = std::chrono::seconds(
+      get_joint_param_int(joint, "calibration_phase_timeout_s",
+                          static_cast<int>(cfg.phase_timeout.count())));
+    cfg.zero_settle = std::chrono::milliseconds(
+      get_joint_param_int(joint, "calibration_zero_settle_ms",
+                          static_cast<int>(cfg.zero_settle.count())));
+
+    cfg.gpio_group_name  = get_joint_param_str(joint, "gpio_group_name", "");
+    cfg.gpio_sensor_name = get_joint_param_str(joint, "gpio_sensor_name", "");
+
+    // ---- Validation ----
+    if (cfg.enabled) {
+      if (cfg.search_step <= 0.0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Joint %s: calibration_search_step must be > 0", joint.name.c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      if (cfg.search_step > jl.range * 0.1) {
+        RCLCPP_WARN(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Joint %s: calibration_search_step (%f) is large relative to range (%f); "
+          "consider reducing for safety",
+          joint.name.c_str(), cfg.search_step, jl.range);
+      }
+      if (cfg.position_tolerance <= 0.0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Joint %s: calibration_position_tolerance must be > 0", joint.name.c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      // GPIO sensor requires both names if use_limit_sensor_ is on AND the joint
+      // declares one. Mixed config is OK (some joints use sensor, others fall
+      // back to torque+timeout).
+      const bool gpio_partial =
+        (cfg.gpio_group_name.empty()) != (cfg.gpio_sensor_name.empty());
+      if (gpio_partial) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Joint %s: gpio_group_name and gpio_sensor_name must be set together",
+          joint.name.c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      const bool will_use_sensor =
+        use_limit_sensor_ && !cfg.gpio_sensor_name.empty();
+      if (!will_use_sensor && cfg.stall_torque <= 0.0) {
+        RCLCPP_WARN(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Joint %s: no GPIO sensor configured and stall_torque <= 0; "
+          "FIND_ROOT will only be terminated by encoder overflow or timeout",
+          joint.name.c_str());
       }
     }
+
+    // ---- Build outbound MotorCommand record ----
+    MotorCommandMsg msg;
+    msg.can_id = static_cast<uint8_t>(std::stoul(joint.parameters.at("can_id")));
+    msg.is_calibrated = bypass;  // bypass means we trust the existing zero
+    msg.calibrate = false;
     motor_msgs_.emplace_back(msg);
   }
 
-  // Enable control server
-  node_ = std::make_shared<rclcpp::Node>("lift_platform_node");
-  motor_srvr_ = node_->create_service<MotorControlService>(
+  // -------------------- ROS plumbing --------------------
+  if (auto locked_executor = params.executor.lock())
+  {
+    std::string node_name = this->get_name() + "_internal_node";
+    node_ = std::make_shared<rclcpp::Node>(node_name);
+
+    // Register the custom node into the ControllerManager's executor hierarchy
+    locked_executor->add_node(node_->get_node_base_interface());
+    
+    motor_srvr_ = node_->create_service<MotorControlService>(
     "lift_platform_hardware",
     std::bind(&CubeMarsSystemHardware::motor_control_callback, this,
-    std::placeholders::_1, std::placeholders::_2)
-  );
+              std::placeholders::_1, std::placeholders::_2));
 
-  // Setup GPIO subscriber
-  // sub_gpio_states_ = node_->create_subscription<ControlMessage>(
-  //   TOPIC_GPIO_STATES,
-  //   rclcpp::SystemDefaultsQoS(),
-  //   std::bind(&CubeMarsSystemHardware::process_gpio_message, this, std::placeholders::_1),
-  //   sub_options
-  // );
+    if (use_limit_sensor_) {
+      sub_gpio_states_ = node_->create_subscription<ControlMessage>(
+        global_cfg_.gpio_states_topic,
+        rclcpp::SystemDefaultsQoS(),
+        std::bind(&CubeMarsSystemHardware::process_gpio_message,
+                  this, std::placeholders::_1));
+    }
 
-  // Setup the realtime publisher
-  s_publisher_ = get_node()->create_publisher<MotorCommandGrp>(
-    "lift_platform_status", rclcpp::SystemDefaultsQoS());
-  state_publisher_ =
-    std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
-  
-  //Initialize Calibration Params
-  for(size_t i = 0; i < info_.joints.size(); ++i) { 
-    if(motor_msgs_[i].calibrate)
-      calibration_phase_[i] = CalibrationPhase::FIND_ROOT;
+    s_publisher_ = get_node()->create_publisher<MotorCommandGrp>(
+      "lift_platform_status", rclcpp::SystemDefaultsQoS());
+    state_publisher_ =
+      std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
+
+    RCLCPP_INFO(node_->get_logger(), "Successfully registered internal node and hooks to executor.");
+  }
+  else
+  {
+    RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Failed to lock the executor pointer!");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  // -------------------- auto-calibrate latching --------------------
+  // We DON'T set has_request_ here directly; on_activate will queue a synthetic
+  // request once interfaces are claimed. Setting it at init time risks
+  // triggering before the controller is ready.
+
+  // Mark default ENABLE for downstream message publishing.
+  for (std::size_t i = 0; i < n; ++i) {
     motor_msgs_[i].get_motor_state = MotorCommandMsg::ENABLE;
   }
 
@@ -198,24 +300,23 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_configure(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  const hardware_interface::CallbackReturn result = can_.connect(can_itf_, can_ids_, 0xFFU)
-                                                      ? hardware_interface::CallbackReturn::SUCCESS
-                                                      : hardware_interface::CallbackReturn::FAILURE;
+  const hardware_interface::CallbackReturn result =
+    can_.connect(can_itf_, can_ids_, 0xFFU)
+      ? hardware_interface::CallbackReturn::SUCCESS
+      : hardware_interface::CallbackReturn::FAILURE;
 
   RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Communication active");
-
   return result;
 }
 
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_cleanup(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  const hardware_interface::CallbackReturn result = can_.disconnect()
-                                                      ? hardware_interface::CallbackReturn::SUCCESS
-                                                      : hardware_interface::CallbackReturn::FAILURE;
-
+  const hardware_interface::CallbackReturn result =
+    can_.disconnect()
+      ? hardware_interface::CallbackReturn::SUCCESS
+      : hardware_interface::CallbackReturn::FAILURE;
   RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Communication closed");
-
   return result;
 }
 
@@ -223,8 +324,7 @@ std::vector<hardware_interface::StateInterface>
 CubeMarsSystemHardware::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> state_interfaces;
-  for (std::size_t i = 0; i < info_.joints.size(); i++)
-  {
+  for (std::size_t i = 0; i < info_.joints.size(); i++) {
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_positions_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
@@ -234,7 +334,6 @@ CubeMarsSystemHardware::export_state_interfaces()
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints[i].name, "temperature", &hw_states_temperatures_[i]));
   }
-
   return state_interfaces;
 }
 
@@ -242,8 +341,7 @@ std::vector<hardware_interface::CommandInterface>
 CubeMarsSystemHardware::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
-  for (std::size_t i = 0; i < info_.joints.size(); i++)
-  {
+  for (std::size_t i = 0; i < info_.joints.size(); i++) {
     command_interfaces.emplace_back(hardware_interface::CommandInterface(
       info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_commands_positions_[i]));
     command_interfaces.emplace_back(hardware_interface::CommandInterface(
@@ -253,7 +351,6 @@ CubeMarsSystemHardware::export_command_interfaces()
     command_interfaces.emplace_back(hardware_interface::CommandInterface(
       info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_commands_efforts_[i]));
   }
-
   return command_interfaces;
 }
 
@@ -263,75 +360,42 @@ hardware_interface::return_type CubeMarsSystemHardware::prepare_command_mode_swi
 {
   stop_modes_.clear();
   start_modes_.clear();
-
   stop_modes_.resize(info_.joints.size(), false);
 
-  // Define allowed combination of command interfaces
-  std::unordered_set<std::string> eff {"effort"};
-  std::unordered_set<std::string> vel {"velocity"};
-  std::unordered_set<std::string> pos {"position"};
-  
+  std::unordered_set<std::string> eff{"effort"};
+  std::unordered_set<std::string> vel{"velocity"};
+  std::unordered_set<std::string> pos{"position"};
+
   std::unordered_set<std::string> joint_interfaces;
-  for (std::size_t i = 0; i < info_.joints.size(); i++)
-  {
-    // find stop modes
-    for (std::string key : stop_interfaces)
-    {
+  for (std::size_t i = 0; i < info_.joints.size(); i++) {
+    for (std::string key : stop_interfaces) {
       RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "stop interface: %s", key.c_str());
-      if (key.find(info_.joints[i].name) != std::string::npos)
-      {
+      if (key.find(info_.joints[i].name) != std::string::npos) {
         stop_modes_[i] = true;
         break;
       }
     }
 
-    // find start modes
     joint_interfaces.clear();
-    for (std::string key : start_interfaces)
-    {
+    for (std::string key : start_interfaces) {
       RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "start interface: %s", key.c_str());
-      if (key.find(info_.joints[i].name) != std::string::npos)
-      {
+      if (key.find(info_.joints[i].name) != std::string::npos) {
         joint_interfaces.insert(key.substr(key.find("/") + 1));
       }
     }
-    if (joint_interfaces == eff)
-    {
+    if (joint_interfaces == eff) {
       start_modes_.push_back(CURRENT_LOOP);
-    }
-    else if (joint_interfaces == vel)
-    {
+    } else if (joint_interfaces == vel) {
       start_modes_.push_back(SPEED_LOOP);
-    }
-    else if (joint_interfaces == pos)
-    {
-      if (limits_[i].first == 0 || limits_[i].second == 0)
-      {
-        start_modes_.push_back(POSITION_LOOP);
-      }
-      else
-      {
-        start_modes_.push_back(POSITION_SPEED_LOOP);
-      }
-    }
-    else if (joint_interfaces.empty())
-    {
-      if (stop_modes_[i])
-      {
-        start_modes_.push_back(UNDEFINED);
-      }
-      else
-      {
-        // don't change control mode
-        start_modes_.push_back(control_mode_[i]);
-      }
-    }
-    else
-    {
+    } else if (joint_interfaces == pos) {
+      start_modes_.push_back(
+        (limits_[i].first == 0 || limits_[i].second == 0) ? POSITION_LOOP : POSITION_SPEED_LOOP);
+    } else if (joint_interfaces.empty()) {
+      start_modes_.push_back(stop_modes_[i] ? UNDEFINED : control_mode_[i]);
+    } else {
       return hardware_interface::return_type::ERROR;
     }
   }
-
   return hardware_interface::return_type::OK;
 }
 
@@ -339,569 +403,671 @@ hardware_interface::return_type CubeMarsSystemHardware::perform_command_mode_swi
   const std::vector<std::string> & /*start_interfaces*/,
   const std::vector<std::string> & /*stop_interfaces*/)
 {
-  for (std::size_t i = 0; i < info_.joints.size(); i++)
-  {
-    if (stop_modes_[i])
-    {
+  for (std::size_t i = 0; i < info_.joints.size(); i++) {
+    if (stop_modes_[i]) {
       hw_commands_efforts_[i] = std::numeric_limits<double>::quiet_NaN();
       hw_commands_velocities_[i] = std::numeric_limits<double>::quiet_NaN();
       hw_commands_positions_[i] = std::numeric_limits<double>::quiet_NaN();
     }
-    // switch control mode
     control_mode_[i] = start_modes_[i];
   }
   return hardware_interface::return_type::OK;
 }
 
-
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  {
-    // Start the background thread
-    thread_running_.store(true);
-    service_thread_ = std::thread([this]() {
-      // This executor only handles callbacks for the service node
-      rclcpp::executors::SingleThreadedExecutor executor;
-      executor.add_node(node_);
-      
-      while (thread_running_.load() && rclcpp::ok()) {
-        executor.spin_some();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  thread_running_.store(true);
+  service_thread_ = std::thread([this]() {
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node_);
+    while (thread_running_.load() && rclcpp::ok()) {
+      executor.spin_some();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+
+  // Auto-calibrate kicks in here, only for joints that are configured for it.
+  // We synthesize a "calibrate everything" command into the mailbox so the
+  // normal request path handles it.
+  if (global_cfg_.auto_calibrate_on_activate) {
+    std::vector<MotorCommandMsg> auto_cmd(info_.joints.size());
+    bool any_to_calibrate = false;
+    for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+      auto_cmd[i].can_id = motor_msgs_[i].can_id;
+      auto_cmd[i].set_motor_state = 0;
+      if (calibration_cfg_[i].enabled && !motor_msgs_[i].is_calibrated) {
+        auto_cmd[i].calibrate = true;
+        any_to_calibrate = true;
       }
-    });
+    }
+    if (any_to_calibrate) {
+      command_mailbox_.set(auto_cmd);
+      has_request_.store(true);
+      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Auto-calibration queued on activate");
+    }
   }
+
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_deactivate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  {
-    // Gracefully stop and join the thread
-    thread_running_.store(false);
-    if (service_thread_.joinable()) {
-      service_thread_.join();
-    }
-  }
+  thread_running_.store(false);
+  if (service_thread_.joinable()) service_thread_.join();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
+// ============================================================================
+// Calibration helpers
+// ============================================================================
+
+void CubeMarsSystemHardware::enter_calibration(std::size_t i)
+{
+  // Wipe any prior offset so the raw encoder frame == calibration frame.
+  // This is critical: phases 1-3 rely on raw readings.
+  enc_offs_[i] = 0.0;
+
+  calibration_rt_[i] = CalibrationRuntime{};
+  // Seed the setpoint from the current encoder position so the first FIND_ROOT
+  // step is a small delta from where the lift actually is, not a jump from 0.
+  // If the read hasn't populated yet, fall back to 0.
+  calibration_rt_[i].commanded_setpoint =
+    std::isnan(hw_states_positions_[i]) ? 0.0 : hw_states_positions_[i];
+  motor_msgs_[i].is_calibrated = false;
+  motor_msgs_[i].calibrate = true;
+
+  set_phase(i, CalibrationPhase::FIND_ROOT);
+  RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+              "Joint %zu: entering calibration (range=%.4f, mount_dir=%s, start=%.4f)",
+              i, hardware_limits_[i].range, mount_dir_[i] ? "up=+" : "up=-",
+              calibration_rt_[i].commanded_setpoint);
+}
+
+void CubeMarsSystemHardware::set_phase(std::size_t i, CalibrationPhase p)
+{
+  const auto now = std::chrono::steady_clock::now();
+  RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+              "Joint %zu: phase %s -> %s",
+              i, to_string(calibration_rt_[i].phase), to_string(p));
+  calibration_rt_[i].phase = p;
+  calibration_rt_[i].phase_started = now;
+  calibration_rt_[i].last_step = now;
+  calibration_rt_[i].zero_cmd_pending = false;
+  calibration_rt_[i].limit_sensor_seen = false;
+}
+
+void CubeMarsSystemHardware::issue_zero_command(std::size_t i)
+{
+  // Stop any motion before zeroing.
+  can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+  // Set encoder origin.
+  can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
+  calibration_rt_[i].zero_issued = std::chrono::steady_clock::now();
+  calibration_rt_[i].zero_cmd_pending = true;
+}
+
+double CubeMarsSystemHardware::step_calibration(std::size_t i)
+{
+  // Returns the raw-frame setpoint to send this cycle, or NaN to skip writing.
+  using namespace std::chrono;
+  auto & rt = calibration_rt_[i];
+  const auto & cfg = calibration_cfg_[i];
+  const auto now = steady_clock::now();
+
+  // Honor the zero-settle window: don't transition until the motor has had
+  // time to acknowledge the SETZEROPOSCMD and report fresh readings.
+  if (rt.zero_cmd_pending) {
+    if (now - rt.zero_issued < cfg.zero_settle) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    rt.zero_cmd_pending = false;
+  }
+
+  // Direction multiplier: in raw frame, "up" is +1 when mount_dir_ is true.
+  const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
+  const double half_range = hardware_limits_[i].range * 0.5;
+
+  switch (rt.phase) {
+    case CalibrationPhase::FIND_ROOT: {
+      // First, check whether we've already arrived at the bottom this cycle.
+      // hw_states_positions_[i] is the reported position; during FIND_ROOT
+      // enc_offs_ == 0 so reported == raw (in joint units). For the overflow
+      // backstop we need the int16 raw count: convert the threshold into
+      // joint units so we can compare apples to apples.
+      const double overflow_thresh_units =
+        (global_cfg_.encoder_overflow_threshold * 0.1 * M_PI / 180.0) *
+        (use_meters_ ? 0.01 : 1.0);
+
+      const bool gpio_active =
+        use_limit_sensor_ && !cfg.gpio_sensor_name.empty();
+      bool bottom_found = false;
+
+      if (gpio_active) {
+        bottom_found = rt.limit_sensor_seen;
+      } else {
+        if (cfg.stall_torque > 0.0 &&
+            std::abs(hw_states_efforts_[i]) >= cfg.stall_torque)
+        {
+          bottom_found = true;
+        }
+        if (!bottom_found &&
+            std::chrono::steady_clock::now() - rt.phase_started >= cfg.phase_timeout)
+        {
+          RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                      "Joint %zu: FIND_ROOT timed out, assuming bottom reached", i);
+          bottom_found = true;
+        }
+      }
+      // Overflow backstop applies regardless of detection method.
+      if (!bottom_found &&
+          std::abs(hw_states_positions_[i]) >= overflow_thresh_units)
+      {
+        RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu: encoder near int16 overflow during FIND_ROOT",
+                    i);
+        bottom_found = true;
+      }
+
+      if (bottom_found) {
+        // Stop motion immediately and transition.
+        can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+        set_phase(i, CalibrationPhase::SET_BOTTOM_ZERO);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+
+      // Otherwise advance the setpoint by one search step (paced).
+      if (now - rt.last_step >= cfg.step_period) {
+        rt.commanded_setpoint += -dir_up * cfg.search_step;
+        rt.last_step = now;
+      }
+      return rt.commanded_setpoint;
+    }
+
+    case CalibrationPhase::SET_BOTTOM_ZERO: {
+      issue_zero_command(i);
+      // After settle, the encoder reads ~0 at the bottom.
+      // Next phase commands the midpoint in the (new) raw frame.
+      rt.commanded_setpoint = dir_up * half_range;
+      set_phase(i, CalibrationPhase::FIND_MIDSECTION);
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    case CalibrationPhase::FIND_MIDSECTION: {
+      // Drive to mid in the raw frame. enc_offs_ is still 0 here so reported
+      // position == raw position.
+      const double err = rt.commanded_setpoint - hw_states_positions_[i];
+      if (std::abs(err) < cfg.position_tolerance) {
+        set_phase(i, CalibrationPhase::SET_MID_ZERO);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      // Phase timeout protects against the lift never reaching mid.
+      if (now - rt.phase_started >= cfg.phase_timeout) {
+        RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                     "Joint %zu: FIND_MIDSECTION timed out (err=%.4f)", i, err);
+        set_phase(i, CalibrationPhase::FAILED);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      return rt.commanded_setpoint;
+    }
+
+    case CalibrationPhase::SET_MID_ZERO: {
+      issue_zero_command(i);
+      // Compute the offset. After zeroing at the midpoint, raw encoder == 0
+      // physically corresponds to the midpoint. We want reported position
+      // == 0 at the *bottom*, so reported = raw - offset, and at the bottom:
+      //   raw at bottom = -dir_up * half_range
+      //   reported = 0  =>  offset = -dir_up * half_range
+      enc_offs_[i] = -dir_up * half_range;
+      // Drive to the bottom in the raw frame; reported position will then
+      // become 0 as we arrive.
+      rt.commanded_setpoint = -dir_up * half_range;
+      set_phase(i, CalibrationPhase::RETURN_TO_HOME);
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    case CalibrationPhase::RETURN_TO_HOME: {
+      // hw_states_positions_[i] is in the reported (offset-applied) frame
+      // at this point. We want reported ≈ 0 (the bottom = operational zero).
+      const double err = hw_states_positions_[i];  // target is 0
+      if (std::abs(err) < cfg.position_tolerance) {
+        motor_msgs_[i].is_calibrated = true;
+        motor_msgs_[i].calibrate = false;
+        set_phase(i, CalibrationPhase::DONE);
+        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu: calibration DONE (enc_off=%.4f)", i, enc_offs_[i]);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      if (now - rt.phase_started >= cfg.phase_timeout) {
+        RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                     "Joint %zu: RETURN_TO_HOME timed out (err=%.4f)", i, err);
+        set_phase(i, CalibrationPhase::FAILED);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      // Target in raw frame == bottom == -dir_up*half_range, but the
+      // POSITION_SPEED_LOOP write path adds enc_offs_ to the input, so we
+      // pass the reported-frame target (0.0) and let it be re-offset.
+      return 0.0;
+    }
+
+    case CalibrationPhase::DONE:
+    case CalibrationPhase::FAILED:
+    case CalibrationPhase::DEFAULT:
+    default:
+      return std::numeric_limits<double>::quiet_NaN();
+  }
+}
+
+// ============================================================================
+// read()
+// ============================================================================
 hardware_interface::return_type CubeMarsSystemHardware::read(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  bool all_ids[can_ids_.size()] = { false };
+  std::vector<bool> all_ids(can_ids_.size(), false);
   std::uint32_t read_id;
   std::uint8_t read_data[8];
   std::uint8_t read_len;
 
-  std::int16_t pos_int;
-
-  // read all buffered CAN messages
-  while (can_.read_nonblocking(read_id, read_data, read_len))
-  {
-    if (read_data[7] != 0)
-    {
-      switch(read_data[7])
-      {
-        case 1:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Motor over-temperature fault.");
-          break;
-        case 2:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Over-current fault.");
-          break;
-        case 3:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Over-voltage fault.");
-          break;
-        case 4:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Under-voltage fault.");
-          break;
-        case 5:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Encoder fault.");
-          break;
-        case 6:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "MOSFET over-temperature fault.");
-          break;
-        case 7:
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Motor stall.");
-          break;
-        return hardware_interface::return_type::ERROR;
+  while (can_.read_nonblocking(read_id, read_data, read_len)) {
+    if (read_data[7] != 0) {
+      switch (read_data[7]) {
+        case 1: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Motor over-temperature fault."); break;
+        case 2: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Over-current fault."); break;
+        case 3: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Over-voltage fault."); break;
+        case 4: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Under-voltage fault."); break;
+        case 5: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Encoder fault."); break;
+        case 6: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "MOSFET over-temperature fault."); break;
+        case 7: RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Motor stall."); break;
+        default: break;
       }
     }
     auto it = std::find(can_ids_.begin(), can_ids_.end(), read_id);
-    if (it != can_ids_.end())
+    if (it == can_ids_.end()) continue;
+
+    const std::size_t i = std::distance(can_ids_.begin(), it);
+    all_ids[i] = true;
+
+    const std::int16_t pos_raw  = static_cast<std::int16_t>((read_data[0] << 8) | read_data[1]);
+    const std::int16_t vel_raw  = static_cast<std::int16_t>((read_data[2] << 8) | read_data[3]);
+    const std::int16_t curr_raw = static_cast<std::int16_t>((read_data[4] << 8) | read_data[5]);
+    const std::uint8_t temp_raw = read_data[6];
+
+    // Unit conversions ------------------------------------------------------
+    // pos_raw is centidegrees (0.1° per LSB).
+    //   - Convert to radians: pos_raw * 0.1 * π/180
+    //   - If use_meters_, scale to meters using the "1 rad ↔ 1 cm"
+    //     convention (i.e. divide by 100).
+    //   - Subtract enc_offs_, which is stored in output units (m or rad).
+    double pos_output = pos_raw * 0.1 * M_PI / 180.0;
+    if (use_meters_) pos_output /= 100.0;
+    hw_states_positions_[i] = pos_output - enc_offs_[i];
+ 
+    hw_states_velocities_[i] = vel_raw * 10.0 / erpm_conversions_[i];
+ 
+    // Effort: raw is centi-amps; multiply by Kt and gear ratio.
+    const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
+    hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
+ 
+    hw_states_temperatures_[i] = static_cast<double>(temp_raw);
+
+    // ---- Torque-limit handling (operational, NOT calibration) ----
+    // Calibration's own stall threshold is checked inside step_calibration's
+    // FIND_ROOT branch; the operational trq_limit applies only when *not*
+    // calibrating to avoid double-handling.
+    if (trq_limits_[i] != 0 &&
+        std::abs(hw_states_efforts_[i]) > trq_limits_[i] &&
+        !(is_calibration_running_ && motor_msgs_[i].calibrate))
     {
-      int i = std::distance(can_ids_.begin(), it);
-      all_ids[i] = true;
-      pos_int = read_data[0] << 8 | read_data[1];
-      if (std::abs(pos_int) >= 32000)
-      {
-        RCLCPP_INFO(
-          rclcpp::get_logger("CubeMarsSystemHardware"),
-          "Position has reached maximum possible value.");
-        if(is_calibration_running_ && (calibration_phase_[i] == CalibrationPhase::FIND_ROOT))
-        {
-          RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
-          "Switcing phase to midsection find ");
-          //stop operation
-          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-          //set virtual zero - bottom
-          can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
-          // change calibration phase
-          calibration_phase_[i] = zero_at_midpoint_[i] ? CalibrationPhase::FIND_MIDSECTION : CalibrationPhase::INIT;
-        }
-      }
-      hw_states_positions_[i] = pos_int;
-      hw_states_velocities_[i] = std::int16_t (read_data[2] << 8 | read_data[3]);
-      hw_states_efforts_[i] = std::int16_t (read_data[4] << 8 | read_data[5]);
-      hw_states_temperatures_[i] = read_data[6];
+      RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                   "Joint %zu went over torque limit (%f > %f), disabling.",
+                   i, hw_states_efforts_[i], trq_limits_[i]);
+      can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+      motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+    }
+
+    motor_msg_grp_.commands.push_back(motor_msgs_[i]);
+  }
+
+  for (std::size_t i = 0; i < info_.joints.size(); i++) {
+    if (!all_ids[i]) {
+      RCLCPP_WARN_ONCE(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "No CAN message received from CAN ID: %u.", can_ids_[i]);
+    } else if (read_only_[i]) {
+      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Joint %zu: pos: %f", i, hw_states_positions_[i]);
     }
   }
 
-  // check if all CAN IDs have received a message
-  for (std::size_t i = 0; i < info_.joints.size(); i++)
-  {
-    if (!all_ids[i])
-    {
-      RCLCPP_WARN_ONCE(
-        rclcpp::get_logger("CubeMarsSystemHardware"),
-        "No CAN message received from CAN ID: %u. ",
-        can_ids_[i]);
-    }
-    else
-    {
-      // Unit conversions
-      hw_states_positions_[i] = (use_meters_) ? 
-        (hw_states_positions_[i] * 0.1 * M_PI / 180 - enc_offs_[i])/ 100.0 : 
-        (hw_states_positions_[i] * 0.1 * M_PI / 180 - enc_offs_[i]);
-      // TODO convert velocities to rad/s
-      hw_states_velocities_[i] = hw_states_velocities_[i] * 10 / erpm_conversions_[i];
-      hw_states_efforts_[i] = hw_states_efforts_[i] * 0.01 * torque_constants_[i] *
-        std::stoi(info_.joints[i].parameters.at("gear_ratio"));
-      
-      if (trq_limits_[i] != 0 && hw_states_efforts_[i] > trq_limits_[i])
-      {
-        if(is_calibration_running_)
-        {
-          RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
-          "Joint %lu lower limit reached.", i);
-          //stop operation
-          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-          //set virtual zero - bottom
-          can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
-          // change calibration phase
-          calibration_phase_[i] = zero_at_midpoint_[i] ? CalibrationPhase::FIND_MIDSECTION : CalibrationPhase::INIT;
-        }
-        else
-        {
-          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
-            "Joint %lu went over torque limit.", i);
-          // disable motor - during normal operation
-          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-          motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
-        }
-        
-        //return hardware_interface::return_type::ERROR;
-      }
-      if(use_limit_sensor_ && is_calibration_running_ && 
-        calibration_phase_[i] == CalibrationPhase::FIND_ROOT)
-      {// stop and transition using sensor input
-        {// check sensor state
-          ControlMessage latest_msg;
-          rclcpp::MessageInfo info;
-          if (sub_gpio_states_->take(latest_msg, info)) {
-              // Message received! Process it:
-              process_gpio_message(latest_msg);
-              if(limit_sensor_state_){
-                limit_sensor_state_.store(false);
-                //stop operation
-                can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-                //set virtual zero - bottom
-                can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
-                // change calibration phase
-                calibration_phase_[i] = zero_at_midpoint_[i] ? CalibrationPhase::FIND_MIDSECTION : CalibrationPhase::INIT;
-              }
-          }
-        }
-      }
-
-      if (read_only_[i])
-      {
-        // RCLCPP_INFO(
-        //   rclcpp::get_logger("CubeMarsSystemHardware"),
-        //   "read states joint %lu: pos %f, spd %f, eff %f, temp %f",
-        //   i, hw_states_positions_[i], hw_states_velocities_[i], hw_states_efforts_[i], hw_states_temperatures_[i]);
-        RCLCPP_INFO(
-          rclcpp::get_logger("CubeMarsSystemHardware"),
-          "Joint %lu: pos: %f",
-          i, hw_states_positions_[i]);
-
-      }
-
-      // populate motor group message
-      motor_msg_grp_.commands.push_back(motor_msgs_[i]);
-    }
-  }
-
-  // Publish the motor states
   state_publisher_->try_publish(motor_msg_grp_);
   motor_msg_grp_.commands.clear();
 
   return hardware_interface::return_type::OK;
 }
 
+// ============================================================================
+// write()
+// ============================================================================
 hardware_interface::return_type CubeMarsSystemHardware::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  // fetch mailbox data if has request - once
-  if(has_request_)
-  {
+  // ---- Consume mailbox once per request ----
+  // Order matters: set is_calibration_running_ BEFORE clearing has_request_
+  // so other readers don't see a brief window with neither flag set.
+  if (has_request_.load()) {
     std::vector<MotorCommandMsg> latest_cmd = command_mailbox_.get();
-    for (std::size_t i = 0; i < info_.joints.size(); i++){
-      if(motor_msgs_[i].can_id == latest_cmd[i].can_id)
-      {
-        motor_msgs_[i].calibrate = latest_cmd[i].calibrate;
+    bool any_calibration = false;
+    bool any_state_change = false;
+
+    for (std::size_t i = 0; i < info_.joints.size(); i++) {
+      if (i >= latest_cmd.size()) break;
+      if (motor_msgs_[i].can_id != latest_cmd[i].can_id) continue;
+
+      if (latest_cmd[i].calibrate && calibration_cfg_[i].enabled) {
+        enter_calibration(i);
+        any_calibration = true;
+      } else {
         motor_msgs_[i].set_motor_state = latest_cmd[i].set_motor_state;
-        if(motor_msgs_[i].calibrate) // will perform calibration action
-          is_calibration_running_.store(true);
+        if (latest_cmd[i].set_motor_state > 0) any_state_change = true;
       }
     }
-    if(!is_calibration_running_) is_changing_state_.store(true);
+
+    if (any_calibration) is_calibration_running_.store(true);
+    if (any_state_change) is_changing_state_.store(true);
     has_request_.store(false);
   }
 
-  for (std::size_t i = 0; i < info_.joints.size(); i++)
-  {
-    if (!read_only_[i] && (motor_msgs_[i].get_motor_state == MotorCommandMsg::ENABLE))
-    {
-      switch (control_mode_[i])
+  // ---- Per-joint command emission ----
+  for (std::size_t i = 0; i < info_.joints.size(); i++) {
+    if (read_only_[i] || motor_msgs_[i].get_motor_state != MotorCommandMsg::ENABLE) {
+      continue;
+    }
+
+    // Calibration in progress for this joint? It overrides whatever the
+    // controller is commanding.
+    const bool joint_calibrating =
+      is_calibration_running_.load() && motor_msgs_[i].calibrate;
+
+    if (joint_calibrating) {
+      // Calibration runs ONLY in POSITION_SPEED_LOOP. If the controller hasn't
+      // claimed position interfaces, we cannot safely move the joint; mark it
+      // FAILED rather than silently doing nothing.
+      if (control_mode_[i] != POSITION_SPEED_LOOP &&
+          control_mode_[i] != POSITION_LOOP)
       {
-        case UNDEFINED:
-        {
-            // RCLCPP_INFO(
-            //   rclcpp::get_logger("CubeMarsSystemHardware"),
-            //   "Nothing is using the hardware interface!");
-            break;
+        RCLCPP_ERROR_ONCE(rclcpp::get_logger("CubeMarsSystemHardware"),
+                          "Joint %zu: calibration requires position control mode "
+                          "(current=%d); aborting", i, control_mode_[i]);
+        set_phase(i, CalibrationPhase::FAILED);
+      } else {
+        const double cal_cmd = step_calibration(i);
+
+        // FAILED terminates this joint: stop motion, mark uncalibrated, move on.
+        if (calibration_rt_[i].phase == CalibrationPhase::FAILED) {
+          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+          motor_msgs_[i].calibrate = false;
+          motor_msgs_[i].is_calibrated = false;
+          motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+          continue;
         }
-        case CURRENT_LOOP:
-        {
-          if (!std::isnan(hw_commands_efforts_[i]))
-          {
-            std::int32_t current = hw_commands_efforts_[i] * 1000 / torque_constants_[i];
-            if (std::abs(current) >= 60000)
-            {
-              RCLCPP_ERROR(
-                rclcpp::get_logger("CubeMarsSystemHardware"),
-                "current command is over maximal allowed value of 60000: %d", current);
-              return hardware_interface::return_type::ERROR;
-            }
-            // RCLCPP_INFO(
-            //   rclcpp::get_logger("CubeMarsSystemHardware"),
-            //   "current command for joint %lu: %d", i, current);
 
-            std::uint8_t data[4];
-            data[0] = current >> 24;
-            data[1] = current >> 16;
-            data[2] = current >> 8;
-            data[3] = current;
-
-            can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, data, 4);
+        if (!std::isnan(cal_cmd)) {
+          // Build a position-speed-loop frame. `cal_cmd` is in reported-frame
+          // units (m or rad); convert through enc_offs_ then to centidegrees*1e2.
+          double cmd = cal_cmd;
+          if (use_meters_) cmd *= 100.0;
+          const std::int32_t position =
+            static_cast<std::int32_t>((cmd + enc_offs_[i]) * 10000.0 * 180.0 / M_PI);
+          if (std::abs(position) >= 360000000) {
+            RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                         "Joint %zu: calibration position command out of range: %d",
+                         i, position);
+            set_phase(i, CalibrationPhase::FAILED);
+            continue;
           }
-          break;
+          const std::int16_t vel = limits_[i].first;
+          const std::int16_t acc = limits_[i].second;
+          std::uint8_t data[8];
+          data[0] = position >> 24; data[1] = position >> 16;
+          data[2] = position >> 8;  data[3] = position;
+          data[4] = vel >> 8;       data[5] = vel;
+          data[6] = acc >> 8;       data[7] = acc;
+          can_.write_message(can_ids_[i] | POSITION_SPEED_LOOP << 8, data, 8);
         }
-        case SPEED_LOOP:
-        {
-          if (!std::isnan(hw_commands_velocities_[i]))
-          {
-            std::int32_t speed = hw_commands_velocities_[i] * erpm_conversions_[i];
-            if (std::abs(speed) >= 100000)
-            {
-              RCLCPP_ERROR(
-                rclcpp::get_logger("CubeMarsSystemHardware"),
-                "speed command is over maximal allowed value of 100000: %d", speed);
-              return hardware_interface::return_type::ERROR;
-            }
-            // RCLCPP_INFO(
-            //   rclcpp::get_logger("CubeMarsSystemHardware"),
-            //   "speed command for joint %lu: %d", i, speed);
+        continue;
+      }
+    }
 
-            std::uint8_t data[4];
-            data[0] = speed >> 24;
-            data[1] = speed >> 16;
-            data[2] = speed >> 8;
-            data[3] = speed;
+    // Pending DISABLE from a state-change request?
+    if (is_changing_state_.load() &&
+        motor_msgs_[i].set_motor_state == MotorCommandMsg::DISABLE)
+    {
+      can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+      motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+      continue;
+    }
 
-            can_.write_message(can_ids_[i] | SPEED_LOOP << 8, data, 4);
-          }
-          break;
+    // Reject normal commands to uncalibrated joints that require calibration.
+    if (!motor_msgs_[i].is_calibrated && calibration_cfg_[i].enabled) {
+      RCLCPP_WARN_THROTTLE(
+        rclcpp::get_logger("CubeMarsSystemHardware"),
+        *node_->get_clock(), 5000,
+        "Joint %zu: ignoring command, not calibrated", i);
+      continue;
+    }
+
+    // ---- Normal operation ----
+    switch (control_mode_[i]) {
+      case UNDEFINED:
+        break;
+
+      case CURRENT_LOOP: {
+        if (std::isnan(hw_commands_efforts_[i])) break;
+        std::int32_t current =
+          static_cast<std::int32_t>(hw_commands_efforts_[i] * 1000.0 / torque_constants_[i]);
+        if (std::abs(current) >= 60000) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "current command out of range: %d", current);
+          return hardware_interface::return_type::ERROR;
         }
-        case POSITION_LOOP:
-        {
-          if (!std::isnan(hw_commands_positions_[i]))
-          {
-            std::int32_t position = (hw_commands_positions_[i] + enc_offs_[i]) * 10000 * 180 / M_PI;
-            if (std::abs(position) >= 360000000)
-            {
-              RCLCPP_ERROR(
-                rclcpp::get_logger("CubeMarsSystemHardware"),
-                "speed command is over maximal allowed value of 360000000: %d", position);
-              return hardware_interface::return_type::ERROR;
-            }
-            // RCLCPP_INFO(
-            //   rclcpp::get_logger("CubeMarsSystemHardware"),
-            //   "position command for joint %lu: %d", i, position);
+        std::uint8_t data[4]{
+          static_cast<std::uint8_t>(current >> 24),
+          static_cast<std::uint8_t>(current >> 16),
+          static_cast<std::uint8_t>(current >> 8),
+          static_cast<std::uint8_t>(current)};
+        can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, data, 4);
+        break;
+      }
 
-            std::uint8_t data[4];
-            data[0] = position >> 24;
-            data[1] = position >> 16;
-            data[2] = position >> 8;
-            data[3] = position;
-
-            can_.write_message(can_ids_[i] | POSITION_LOOP << 8, data, 4);
-          }
-          break;
-        case POSITION_SPEED_LOOP:
-        {
-          if (!std::isnan(hw_commands_positions_[i]))
-          {
-            double input_cmd = (is_calibration_running_ && motor_msgs_[i].calibrate) ? 
-              hw_states_positions_[i] : hw_commands_positions_[i];
-
-            //Clamp command to specified hardware limits
-            if(motor_msgs_[i].is_calibrated){
-              if(input_cmd < 0.0) input_cmd = 0.0;
-              if(input_cmd > hardware_limits_[i].range) input_cmd = hardware_limits_[i].range;
-            } else {
-              if(input_cmd < -hardware_limits_[i].range) input_cmd = -hardware_limits_[i].range;
-              if(input_cmd > hardware_limits_[i].range) input_cmd = hardware_limits_[i].range;
-            }
-
-            if(use_meters_) input_cmd *= 100.0;
-
-            if(is_calibration_running_ && motor_msgs_[i].calibrate)
-            { // Calibration logic goes here
-              switch(calibration_phase_[i])
-              {
-                case CalibrationPhase::FIND_ROOT:
-                {
-                  RCLCPP_INFO(
-                    rclcpp::get_logger("CubeMarsSystemHardware"),
-                    "Finding ROOT, command: %f", input_cmd);
-                  // Check direction of bottom
-                  if(mount_dir_[i]) input_cmd -= CALIBRATIONSTEP;
-                  else input_cmd += CALIBRATIONSTEP;
-                  break; //Transition happens in the feedback read
-                }
-                case CalibrationPhase::FIND_MIDSECTION:
-                {
-                  RCLCPP_INFO(
-                    rclcpp::get_logger("CubeMarsSystemHardware"),
-                    "Going to MIDSECTION");
-                  input_cmd = hardware_limits_[i].range * 0.5;
-                  double cur_state = hw_states_positions_[i];
-
-                  //check if at mid-section
-                  if(std::abs(input_cmd - cur_state) < CALIBRATIONTHRESHOLD)
-                  {
-                    calibration_phase_[i] = CalibrationPhase::SET_VIRTUAL_ZERO;
-                    return hardware_interface::return_type::OK;
-                  }
-                  break; //transition to set virtual zero
-                }
-                case CalibrationPhase::SET_VIRTUAL_ZERO:
-                {
-                  RCLCPP_INFO(
-                    rclcpp::get_logger("CubeMarsSystemHardware"),
-                    "Setting Virtual Zero");
-                  //set virtual zero - midpoint
-                  can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
-                  // change calibration phase
-                  calibration_phase_[i] = CalibrationPhase::INIT;
-                  return hardware_interface::return_type::OK;
-                  break; //transition to proper initialization phase
-                }
-                case CalibrationPhase::INIT:
-                { // send lift to the virtual lower position
-                  RCLCPP_INFO(
-                    rclcpp::get_logger("CubeMarsSystemHardware"),
-                    "Setting INIT and OFFSETS");
-                  if(zero_at_midpoint_[i])
-                  {
-                    double midpoint = hardware_limits_[i].range * 0.5;
-                    input_cmd = (mount_dir_[i]) ? -midpoint : midpoint;
-                    double cur_state = hw_states_positions_[i];
-
-                    //check if at virtual lower section (bottom)
-                    if (std::abs(input_cmd - cur_state) < CALIBRATIONTHRESHOLD)
-                    {
-                      enc_offs_[i] = (mount_dir_[i]) ? -midpoint : midpoint; //set motor offset
-                      motor_msgs_[i].is_calibrated = true;
-                      motor_msgs_[i].calibrate = false;
-                      calibration_phase_[i] = CalibrationPhase::DEFAULT;
-                      return hardware_interface::return_type::OK;
-                    }
-                  }
-                  else
-                  {
-                    motor_msgs_[i].is_calibrated = true;
-                    motor_msgs_[i].calibrate = false;
-                    calibration_phase_[i] = CalibrationPhase::DEFAULT;
-                    return hardware_interface::return_type::OK;
-                  }
-                  
-                  break; //transition to default
-                }
-                default:
-                  break;
-              }
-            }
-
-            if(is_changing_state_ && motor_msgs_[i].set_motor_state == MotorCommandMsg::DISABLE)
-            {// State change logic goes here
-              //stop operation
-              can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-              motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
-              return hardware_interface::return_type::OK;
-            }
-
-            std::int32_t position = (input_cmd + enc_offs_[i]) * 10000 * 180 / M_PI;
-            std::int16_t vel = limits_[i].first;
-            std::int16_t acc = limits_[i].second;
-            if (std::abs(position) >= 360000000)
-            {
-              RCLCPP_ERROR(
-                rclcpp::get_logger("CubeMarsSystemHardware"),
-                "position command is over maximal allowed value of 360000000: %d", position);
-              return hardware_interface::return_type::ERROR;
-            }
-            // RCLCPP_INFO(
-            //   rclcpp::get_logger("CubeMarsSystemHardware"),
-            //   "command for joint %lu: pos %d, vel %d, acc %d",
-            //   i, position, vel, acc);
-
-            std::uint8_t data[8];
-            data[0] = position >> 24;
-            data[1] = position >> 16;
-            data[2] = position >> 8;
-            data[3] = position;
-            data[4] = vel >> 8;
-            data[5] = vel;
-            data[6] = acc >> 8;
-            data[7] = acc;
-
-            can_.write_message(can_ids_[i] | POSITION_SPEED_LOOP << 8, data, 8);
-          }
-          break;
+      case SPEED_LOOP: {
+        if (std::isnan(hw_commands_velocities_[i])) break;
+        std::int32_t speed =
+          static_cast<std::int32_t>(hw_commands_velocities_[i] * erpm_conversions_[i]);
+        if (std::abs(speed) >= 100000) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "speed command out of range: %d", speed);
+          return hardware_interface::return_type::ERROR;
         }
+        std::uint8_t data[4]{
+          static_cast<std::uint8_t>(speed >> 24),
+          static_cast<std::uint8_t>(speed >> 16),
+          static_cast<std::uint8_t>(speed >> 8),
+          static_cast<std::uint8_t>(speed)};
+        can_.write_message(can_ids_[i] | SPEED_LOOP << 8, data, 4);
+        break;
+      }
+
+      case POSITION_LOOP: {
+        if (std::isnan(hw_commands_positions_[i])) break;
+        double cmd = hw_commands_positions_[i];
+        if (use_meters_) cmd *= 100.0;
+        const std::int32_t position =
+          static_cast<std::int32_t>((cmd + enc_offs_[i]) * 10000.0 * 180.0 / M_PI);
+        if (std::abs(position) >= 360000000) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "position command out of range: %d", position);
+          return hardware_interface::return_type::ERROR;
         }
-        case SET_ORIGIN_MODE:
-          break;
+        std::uint8_t data[4]{
+          static_cast<std::uint8_t>(position >> 24),
+          static_cast<std::uint8_t>(position >> 16),
+          static_cast<std::uint8_t>(position >> 8),
+          static_cast<std::uint8_t>(position)};
+        can_.write_message(can_ids_[i] | POSITION_LOOP << 8, data, 4);
+        break;
+      }
+
+      case POSITION_SPEED_LOOP: {
+        if (std::isnan(hw_commands_positions_[i])) break;
+        double cmd = hw_commands_positions_[i];
+
+        // Operational clamp: post-calibration, valid range is [0, range].
+        if (motor_msgs_[i].is_calibrated && hardware_limits_[i].range > 0.0) {
+          if (cmd < 0.0) cmd = 0.0;
+          if (cmd > hardware_limits_[i].range) cmd = hardware_limits_[i].range;
+        }
+        if (use_meters_) cmd *= 100.0;
+
+        const std::int32_t position =
+          static_cast<std::int32_t>((cmd + enc_offs_[i]) * 10000.0 * 180.0 / M_PI);
+        if (std::abs(position) >= 360000000) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "position command out of range: %d", position);
+          return hardware_interface::return_type::ERROR;
+        }
+        const std::int16_t vel = limits_[i].first;
+        const std::int16_t acc = limits_[i].second;
+        std::uint8_t data[8];
+        data[0] = position >> 24; data[1] = position >> 16;
+        data[2] = position >> 8;  data[3] = position;
+        data[4] = vel >> 8;       data[5] = vel;
+        data[6] = acc >> 8;       data[7] = acc;
+        can_.write_message(can_ids_[i] | POSITION_SPEED_LOOP << 8, data, 8);
+        break;
+      }
+
+      case SET_ORIGIN_MODE:
+        break;
+    }
+  }
+
+  // ---- Latch global flags down once all joints finish ----
+  if (is_calibration_running_.load()) {
+    bool any_pending = false;
+    for (std::size_t i = 0; i < info_.joints.size(); i++) {
+      if (motor_msgs_[i].calibrate &&
+          calibration_rt_[i].phase != CalibrationPhase::DONE &&
+          calibration_rt_[i].phase != CalibrationPhase::FAILED)
+      {
+        any_pending = true;
+        break;
+      }
+    }
+    if (!any_pending) {
+      is_calibration_running_.store(false);
+      // Summarize.
+      for (std::size_t i = 0; i < info_.joints.size(); i++) {
+        if (!calibration_cfg_[i].enabled) continue;
+        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Calibration summary -- joint %zu: %s (offset=%.4f)",
+                    i, to_string(calibration_rt_[i].phase), enc_offs_[i]);
       }
     }
   }
 
-  {
-    if(is_calibration_running_)
-    {// check & deactivate calibration flag if all completed
-      bool has_pending_calibration = false;
-      for (std::size_t i = 0; i < info_.joints.size(); i++){
-        if(motor_msgs_[i].calibrate)
-            has_pending_calibration = true;
+  if (is_changing_state_.load()) {
+    bool any_pending = false;
+    for (std::size_t i = 0; i < info_.joints.size(); i++) {
+      if (motor_msgs_[i].set_motor_state == MotorCommandMsg::DISABLE) {
+        any_pending = true;
+        break;
       }
-      if(!has_pending_calibration) is_calibration_running_.store(false);
     }
-
-    if(is_changing_state_)
-    {// check & deactivate calibration flag if all completed
-      bool has_pending = false;
-      for (std::size_t i = 0; i < info_.joints.size(); i++){
-        if(motor_msgs_[i].set_motor_state == MotorCommandMsg::DISABLE)
-            has_pending = true;
-      }
-      if(!has_pending) is_changing_state_.store(false);
-    }
+    if (!any_pending) is_changing_state_.store(false);
   }
 
   return hardware_interface::return_type::OK;
 }
 
+// ============================================================================
+// Service callback (non-RT thread)
+// ============================================================================
 void CubeMarsSystemHardware::motor_control_callback(
-    const std::shared_ptr<MotorControlServiceRequest> request,
-    std::shared_ptr<MotorControlServiceResponse> response)
+  const std::shared_ptr<MotorControlServiceRequest> request,
+  std::shared_ptr<MotorControlServiceResponse> response)
 {
-  if(has_request_ || is_calibration_running_ || is_changing_state_)
+  if (has_request_.load() || is_calibration_running_.load() ||
+      is_changing_state_.load())
   {
-    response->success = true;
-    response->message = is_calibration_running_ ? "Calibration in progress" : 
-      "Motor State change in progress";
+    response->success = false;
+    response->message = is_calibration_running_.load()
+      ? "Calibration in progress"
+      : (is_changing_state_.load() ? "Motor state change in progress"
+                                   : "Previous request still pending");
     return;
   }
-  else
-  {
-    {
-      if(request->commands.size() > info_.joints.size())
-      {
+
+  if (request->commands.size() > info_.joints.size()) {
+    response->success = false;
+    response->message = "Invalid Request: too many commands";
+    return;
+  }
+
+  bool trigger_calibration = false;
+  bool has_state_change_req = false;
+  for (std::size_t i = 0; i < request->commands.size(); i++) {
+    if (request->commands[i].calibrate) {
+      if (!calibration_cfg_[i].enabled) {
         response->success = false;
-        response->message = "Invalid Request";
+        response->message = "Joint not eligible for calibration";
         return;
       }
+      trigger_calibration = true;
+    } else if (request->commands[i].set_motor_state > 0) {
+      has_state_change_req = true;
+    }
 
-      bool trigger_calibration = false;
-      bool has_state_change_req = false;
-      for (std::size_t i = 0; i < info_.joints.size(); i++)
-      { //check if has valid request
-        if(request->commands[i].calibrate)
-        {
-          if(hardware_limits_[i].range >= 0.0){
-            trigger_calibration = true;
-            calibration_phase_[i] = CalibrationPhase::FIND_ROOT;
-          }
-        }
-        else {
-          if (request->commands[i].set_motor_state > 0) has_state_change_req = true;
-        }
-
-        if(has_state_change_req && trigger_calibration)
-        { // can't process two different actions at once
-          calibration_phase_[i] = CalibrationPhase::DEFAULT;
-          has_request_.store(false);
-          response->success = false;
-          response->message = "Invalid Action Request";
-          return;
-        }
-      }
-
-      if(has_state_change_req || trigger_calibration) {
-        command_mailbox_.set(request->commands); // set mailbox
-        has_request_.store(true);
-
-        response->success = true;
-        response->message = trigger_calibration ? "Starting calibration" : "Changing motor state";
-        return;
-      }
-      
-      {
-        response->success = false;
-        response->message = "Unknown Request";
-        return;
-      }
-      
+    if (has_state_change_req && trigger_calibration) {
+      response->success = false;
+      response->message = "Cannot mix calibrate and state-change in one request";
+      return;
     }
   }
+
+  if (!has_state_change_req && !trigger_calibration) {
+    response->success = false;
+    response->message = "Unknown Request";
+    return;
+  }
+
+  command_mailbox_.set(request->commands);
+  has_request_.store(true);
+
+  response->success = true;
+  response->message = trigger_calibration ? "Starting calibration" : "Changing motor state";
 }
 
-void CubeMarsSystemHardware::process_gpio_message(const ControlMessage &msg)
-{// @TODO (ephson) use proper sensor names
-  for (std::size_t i = 0; i < msg.interface_groups.size(); ++i) {
-    const std::string & grp_name = msg.interface_groups[i];
-    if (grp_name == std::string("el1856_card_01")) {
-      const auto & interface_group_values = msg.interface_values[i];
-      for (std::size_t t = 0; t < interface_group_values.interface_names.size(); ++t) {
-        const std::string & ifc_name = interface_group_values.interface_names[t];
-        if (ifc_name == std::string("lower_limit_sensor")) {
-          // Floating-point safe comparison (0.0 is 'High/Pressed')
-          if (interface_group_values.values[t] > 0.5) {
-            limit_sensor_state_.store(true);
+// ============================================================================
+// GPIO message processing — updates per-joint limit-sensor latches.
+// ============================================================================
+void CubeMarsSystemHardware::process_gpio_message(const ControlMessage & msg)
+{
+  for (std::size_t g = 0; g < msg.interface_groups.size(); ++g) {
+    const std::string & grp_name = msg.interface_groups[g];
+    const auto & ifc_values = msg.interface_values[g];
+
+    for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+      const auto & cfg = calibration_cfg_[i];
+      if (cfg.gpio_group_name.empty() || cfg.gpio_sensor_name.empty()) continue;
+      if (cfg.gpio_group_name != grp_name) continue;
+
+      for (std::size_t t = 0; t < ifc_values.interface_names.size(); ++t) {
+        if (ifc_values.interface_names[t] == cfg.gpio_sensor_name) {
+          // Floating-point safe comparison: > 0.5 means "pressed/high".
+          if (ifc_values.values[t] > 0.5) {
+            calibration_rt_[i].limit_sensor_seen = true;
           }
         }
       }
