@@ -782,6 +782,12 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
   // ---- Per-joint command emission ----
   for (std::size_t i = 0; i < info_.joints.size(); i++) {
     if (read_only_[i] || motor_msgs_[i].get_motor_state != MotorCommandMsg::ENABLE) {
+      // Check if state change to ENABLE requested
+      if (is_changing_state_.load() &&
+          motor_msgs_[i].set_motor_state == MotorCommandMsg::ENABLE)
+      {
+        motor_msgs_[i].get_motor_state = MotorCommandMsg::ENABLE;
+      }
       continue;
     }
 
@@ -859,7 +865,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     }
 
     // ---- Normal operation ----
-    switch (control_mode_[i]) {
+    switch (control_mode_[i]) 
+    {
       case UNDEFINED:
         break;
 
