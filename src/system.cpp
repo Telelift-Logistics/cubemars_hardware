@@ -133,26 +133,45 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       std::stoi(joint.parameters.at("gear_ratio")) * 60.0 / (2.0 * M_PI);
     erpm_conversions_.emplace_back(erpm_conversion);
 
-    // (vel, acc) limits for POSITION_SPEED_LOOP
+    // (vel, acc) limits for POSITION_SPEED_LOOP. Users specify both in
+    // OUTPUT-SHAFT units:
+    //   vel_limit:  rad/s
+    //   acc_limit:  rad/s^2
+    // erpm_conversion already accounts for gear ratio and pole pairs, so
+    // the conversion to the wire's ERPM / ERPM-per-s units is a single
+    // multiplication. Bounds-check the floating-point result before casting
+    // to int32 to avoid UB on overflow, NaN, or inf.
     if (joint.parameters.count("acc_limit") != 0 &&
         joint.parameters.count("vel_limit") != 0)
     {
-      std::pair<std::int32_t, std::int32_t> limits;
-      limits.first  = std::stoi(joint.parameters.at("vel_limit")) / 10 * erpm_conversion;
-      limits.second = std::stoi(joint.parameters.at("acc_limit")) / 10 * erpm_conversion;
-      if (limits.first >= 32767 || limits.first <= 0) {
+      const double vel_rad_s  = std::stod(joint.parameters.at("vel_limit"));
+      const double acc_rad_s2 = std::stod(joint.parameters.at("acc_limit"));
+      const double vel_erpm   = vel_rad_s  * erpm_conversion;
+      const double acc_erpm   = acc_rad_s2 * erpm_conversion;
+
+      auto in_int16_range = [](double v) {
+        return std::isfinite(v) && v > 0.0 && v < 32767.0;
+      };
+
+      if (!in_int16_range(vel_erpm)) {
         RCLCPP_ERROR(
           rclcpp::get_logger("CubeMarsSystemHardware"),
-          "velocity limit is not in range 0-32767: %d", limits.first);
+          "vel_limit (%.3f rad/s) -> %.1f ERPM is out of range 1..32766. "
+          "Reduce vel_limit or check pole_pairs/gear_ratio.",
+          vel_rad_s, vel_erpm);
         return hardware_interface::CallbackReturn::ERROR;
       }
-      if (limits.second >= 32767 || limits.second <= 0) {
+      if (!in_int16_range(acc_erpm)) {
         RCLCPP_ERROR(
           rclcpp::get_logger("CubeMarsSystemHardware"),
-          "acceleration limit is not in range 0-32767: %d", limits.second);
+          "acc_limit (%.3f rad/s^2) -> %.1f ERPM/s is out of range 1..32766. "
+          "Reduce acc_limit or check pole_pairs/gear_ratio.",
+          acc_rad_s2, acc_erpm);
         return hardware_interface::CallbackReturn::ERROR;
       }
-      limits_.emplace_back(limits);
+
+      limits_.emplace_back(static_cast<std::int16_t>(vel_erpm),
+                           static_cast<std::int16_t>(acc_erpm));
     } else {
       limits_.emplace_back(std::make_pair(0, 0));
     }
@@ -160,6 +179,25 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     enc_offs_.emplace_back(get_joint_param_double(joint, "enc_off", 0.0));
     trq_limits_.emplace_back(std::max(0.0, get_joint_param_double(joint, "trq_limit", 0.0)));
     read_only_.emplace_back(get_joint_param_int(joint, "read_only", 0) == 1);
+
+    // Lead screw conversion: lead_pitch is linear travel (m) per revolution
+    // of the OUTPUT shaft. Stored internally as m/rad = lead_pitch / (2π).
+    // Required when use_meters_ is set; ignored otherwise.
+    if (use_meters_) {
+      const double lead_pitch =
+        get_joint_param_double(joint, "lead_pitch", 0.0); // TODO: @EPHSON
+      if (lead_pitch <= 0.0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          "Joint %s: use_meters=1 requires a positive 'lead_pitch' parameter "
+          "(meters of linear travel per output-shaft revolution)",
+          joint.name.c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      m_per_rad_.push_back(lead_pitch / (2.0 * M_PI));
+    } else {
+      m_per_rad_.push_back(1.0);  // unused; placeholder keeps vector size aligned
+    }
 
     JointLimits jl;
     jl.range = std::max(0.0, get_joint_param_double(joint, "max_range", 0.0));
@@ -250,13 +288,12 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   }
 
   // -------------------- ROS plumbing --------------------
-  if (auto locked_executor = params.executor.lock())
+  executor_weak_ = params.executor;
+
+  if (auto locked_executor = executor_weak_.lock())
   {
     std::string node_name = this->get_name() + "_internal_node";
     node_ = std::make_shared<rclcpp::Node>(node_name);
-
-    // Register the custom node into the ControllerManager's executor hierarchy
-    locked_executor->add_node(node_->get_node_base_interface());
     
     motor_srvr_ = node_->create_service<MotorControlService>(
     "lift_platform_hardware",
@@ -269,6 +306,15 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
         rclcpp::SystemDefaultsQoS(),
         std::bind(&CubeMarsSystemHardware::process_gpio_message,
                   this, std::placeholders::_1));
+    }
+
+    // Register the custom node into the ControllerManager's executor hierarchy
+    try {
+      locked_executor->add_node(node_->get_node_base_interface());
+    } catch (const std::exception & e) {
+      RCLCPP_FATAL(rclcpp::get_logger("CubeMarsSystemHardware"),
+                   "Failed to add internal node to executor: %s", e.what());
+      return hardware_interface::CallbackReturn::ERROR;
     }
 
     s_publisher_ = get_node()->create_publisher<MotorCommandGrp>(
@@ -312,6 +358,18 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_configure(
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_cleanup(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  if (node_) {
+    if (auto locked_executor = executor_weak_.lock()) {
+      try {
+        locked_executor->remove_node(node_->get_node_base_interface());
+      } catch (const std::exception & e) {
+        RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "remove_node during cleanup raised: %s", e.what());
+      }
+    }
+    node_.reset();
+  }
+
   const hardware_interface::CallbackReturn result =
     can_.disconnect()
       ? hardware_interface::CallbackReturn::SUCCESS
@@ -417,16 +475,6 @@ hardware_interface::return_type CubeMarsSystemHardware::perform_command_mode_swi
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  thread_running_.store(true);
-  service_thread_ = std::thread([this]() {
-    rclcpp::executors::SingleThreadedExecutor executor;
-    executor.add_node(node_);
-    while (thread_running_.load() && rclcpp::ok()) {
-      executor.spin_some();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-  });
-
   // Auto-calibrate kicks in here, only for joints that are configured for it.
   // We synthesize a "calibrate everything" command into the mailbox so the
   // normal request path handles it.
@@ -455,8 +503,6 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_activate(
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_deactivate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  thread_running_.store(false);
-  if (service_thread_.joinable()) service_thread_.join();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -696,20 +742,27 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     const std::uint8_t temp_raw = read_data[6];
 
     // Unit conversions ------------------------------------------------------
-    // pos_raw is centidegrees (0.1° per LSB).
-    //   - Convert to radians: pos_raw * 0.1 * π/180
-    //   - If use_meters_, scale to meters using the "1 rad ↔ 1 cm"
-    //     convention (i.e. divide by 100).
-    //   - Subtract enc_offs_, which is stored in output units (m or rad).
-    double pos_output = pos_raw * 0.1 * M_PI / 180.0;
-    if (use_meters_) pos_output /= 100.0;
+    // Position: pos_raw is in centidegrees (0.1° per LSB) at the output shaft.
+    //   raw → output radians: pos_raw * 0.1 * π/180
+    //   If use_meters_: multiply by m_per_rad_ (lead-screw factor).
+    //   Then subtract enc_offs_, which is in output units (m or rad).
+    const double pos_rad = pos_raw * 0.1 * M_PI / 180.0;
+    const double pos_output =
+      use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
     hw_states_positions_[i] = pos_output - enc_offs_[i];
  
-    hw_states_velocities_[i] = vel_raw * 10.0 / erpm_conversions_[i];
+    // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
+    //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
+    //   If use_meters_, scale rad/s → m/s with the lead-screw factor.
+    const double vel_rad_s = vel_raw / erpm_conversions_[i];
+    hw_states_velocities_[i] =
+      use_meters_ ? (vel_rad_s * m_per_rad_[i]) : vel_rad_s;
  
     // Effort: raw is centi-amps; multiply by Kt and gear ratio.
     const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
     hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
+    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
+                  "Raw Current %zu: Effort: %f", curr_raw*0.01, hw_states_efforts_[i]);
  
     hw_states_temperatures_[i] = static_cast<double>(temp_raw);
 
@@ -736,7 +789,7 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       RCLCPP_WARN_ONCE(rclcpp::get_logger("CubeMarsSystemHardware"),
                        "No CAN message received from CAN ID: %u.", can_ids_[i]);
     } else if (read_only_[i]) {
-      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
                   "Joint %zu: pos: %f", i, hw_states_positions_[i]);
     }
   }
@@ -822,10 +875,14 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         if (!std::isnan(cal_cmd)) {
           // Build a position-speed-loop frame. `cal_cmd` is in reported-frame
           // units (m or rad); convert through enc_offs_ then to centidegrees*1e2.
-          double cmd = cal_cmd;
-          if (use_meters_) cmd *= 100.0;
+          // cal_cmd is in output units (m or rad). Add offset in output units,
+          // convert to output radians via the lead-screw factor (if meters),
+          // then scale to wire centidegree-LSB (× 1e4 × 180/π).
+          double cmd_with_off = cal_cmd + enc_offs_[i];
+          if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
           const std::int32_t position =
-            static_cast<std::int32_t>((cmd + enc_offs_[i]) * 10000.0 * 180.0 / M_PI);
+            static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
+            
           if (std::abs(position) >= 360000000) {
             RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                          "Joint %zu: calibration position command out of range: %d",
@@ -890,8 +947,9 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case SPEED_LOOP: {
         if (std::isnan(hw_commands_velocities_[i])) break;
-        std::int32_t speed =
-          static_cast<std::int32_t>(hw_commands_velocities_[i] * erpm_conversions_[i]);
+        double vel_cmd = hw_commands_velocities_[i];
+        if (use_meters_) vel_cmd /= m_per_rad_[i];  // m/s → rad/s at output shaft
+        std::int32_t speed = static_cast<std::int32_t>(vel_cmd * erpm_conversions_[i]);
         if (std::abs(speed) >= 100000) {
           RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                        "speed command out of range: %d", speed);
@@ -908,10 +966,12 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case POSITION_LOOP: {
         if (std::isnan(hw_commands_positions_[i])) break;
-        double cmd = hw_commands_positions_[i];
-        if (use_meters_) cmd *= 100.0;
+        // Add the offset in output units, convert to output radians via the
+        // lead-screw factor (if meters), then scale to wire centidegree-LSB.
+        double cmd_with_off = hw_commands_positions_[i] + enc_offs_[i];
+        if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
         const std::int32_t position =
-          static_cast<std::int32_t>((cmd + enc_offs_[i]) * 10000.0 * 180.0 / M_PI);
+          static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
         if (std::abs(position) >= 360000000) {
           RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                        "position command out of range: %d", position);
@@ -935,10 +995,12 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
           if (cmd < 0.0) cmd = 0.0;
           if (cmd > hardware_limits_[i].range) cmd = hardware_limits_[i].range;
         }
-        if (use_meters_) cmd *= 100.0;
-
+        // Add the offset in output units, convert to output radians via the
+        // lead-screw factor (if meters), then scale to wire centidegree-LSB.
+        double cmd_with_off = cmd + enc_offs_[i];
+        if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
         const std::int32_t position =
-          static_cast<std::int32_t>((cmd + enc_offs_[i]) * 10000.0 * 180.0 / M_PI);
+          static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
         if (std::abs(position) >= 360000000) {
           RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                        "position command out of range: %d", position);

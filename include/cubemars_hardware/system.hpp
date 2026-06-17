@@ -7,9 +7,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
+
+#include "rclcpp/executor.hpp"
 
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
@@ -107,6 +108,7 @@ private:
   std::vector<double> torque_constants_;
   std::vector<double> enc_offs_;
   std::vector<double> trq_limits_;
+  std::vector<double> m_per_rad_;  // lead screw factor; only used when use_meters_
   std::vector<JointLimits> hardware_limits_;
   std::vector<bool> mount_dir_;          // true = up is +ve in raw encoder frame
   std::vector<bool> zero_at_midpoint_;
@@ -167,8 +169,11 @@ private:
   realtime_tools::RealtimeThreadSafeBox<std::vector<MotorCommandMsg>> command_mailbox_;
   rclcpp::Service<MotorControlService>::SharedPtr motor_srvr_;
   rclcpp::Subscription<ControlMessage>::SharedPtr sub_gpio_states_;
-  std::thread service_thread_;
-  std::atomic<bool> thread_running_{false};
+
+  /// @brief Weak reference to the ControllerManager's executor (provided
+  /// through HardwareComponentInterfaceParams). The CM spins our `node_`
+  /// for us; we do NOT spawn our own thread.
+  std::weak_ptr<rclcpp::Executor> executor_weak_;
 
   std::unique_ptr<realtime_tools::RealtimePublisher<MotorCommandGrp>> state_publisher_;
   std::shared_ptr<rclcpp::Publisher<MotorCommandGrp>> s_publisher_;
