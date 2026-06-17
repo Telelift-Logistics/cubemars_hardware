@@ -185,8 +185,17 @@ private:
   std::atomic<bool> is_changing_state_{false};
   std::atomic<bool> has_request_{false};
 
+  /// Whether to publish output in meters or rads
   bool use_meters_{false};
-  bool use_limit_sensor_{false};
+
+  /// @brief Resolved set-origin CAN payload. Pointer + length so we can
+  /// dispatch the legacy MIT-mode form (8 bytes) and the servo-mode form
+  /// (1 byte) through the same write path.
+  struct SetOriginPayload
+  {
+    const std::uint8_t * data{nullptr};
+    std::uint8_t        len{0};
+  } set_origin_payload_;
 
   /// @brief Per-hardware-stack tunables loaded from URDF <hardware> parameters.
   /// Per-joint values live in CalibrationConfig.
@@ -198,7 +207,12 @@ private:
     /// Hard ceiling on int16 encoder count where we declare "overflow imminent".
     /// CubeMars reports position as int16 centidegrees; ±32000 ≈ ±320°.
     std::int16_t encoder_overflow_threshold{32000};
+    /// Whether to use LIMIT Sensor for finding ROOT
+    bool use_limit_sensor{false};
+    /// Number of calibration retry attempts
+    std::int16_t max_retries;
   } global_cfg_;
+  uint16_t retry_cnt_{0};
 };
 
 }  // namespace cubemars_hardware

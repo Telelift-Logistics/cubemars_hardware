@@ -26,6 +26,16 @@ namespace cubemars_hardware
     // adjust the length in the write_message() call sites.
     static inline constexpr std::uint8_t SETZEROPOSCMD[8] =
         {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE};
+    // CubeMars AK servo-mode "set origin" payloads. Control mode 5
+    // (SET_ORIGIN_MODE) takes a single byte:
+    //   0x00 -- temporary zero (lost on power cycle); preferred for
+    //           calibrate-on-startup workflows since it avoids wearing the
+    //           motor's NVM.
+    //   0x01 -- permanent zero (written to NVM; finite write endurance).
+    //   0x02 -- restore the factory zero, discarding any prior set_origin.
+    static inline constexpr std::uint8_t SET_ORIGIN_TEMPORARY[1] = {0x00};
+    static inline constexpr std::uint8_t SET_ORIGIN_PERMANENT[1] = {0x01};
+    static inline constexpr std::uint8_t SET_ORIGIN_RESTORE[1]   = {0x02};
 
     // ---------------------------------------------------------------------------
     // Joint kinematic limits (set from URDF)
@@ -60,6 +70,7 @@ namespace cubemars_hardware
         RETURN_TO_HOME = 5,
         DONE = 6,
         FAILED = 7,
+        SET_RETRY_ZERO = 8,
         DEFAULT = 0  // not running
     };
 
@@ -71,6 +82,7 @@ namespace cubemars_hardware
             case CalibrationPhase::FIND_MIDSECTION: return "FIND_MIDSECTION";
             case CalibrationPhase::SET_MID_ZERO: return "SET_MID_ZERO";
             case CalibrationPhase::RETURN_TO_HOME: return "RETURN_TO_HOME";
+            case CalibrationPhase::SET_RETRY_ZERO: return "SET_RETRY_ZERO";
             case CalibrationPhase::DONE: return "DONE";
             case CalibrationPhase::FAILED: return "FAILED";
             case CalibrationPhase::DEFAULT: return "DEFAULT";

@@ -90,13 +90,42 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   }
 
   use_meters_       = (get_hw_param_int(info_, "use_meters", 0) == 1);
-  use_limit_sensor_ = (get_hw_param_int(info_, "use_limit_sensor", 0) == 1);
+  global_cfg_.use_limit_sensor = (get_hw_param_int(info_, "use_limit_sensor", 0) == 1);
   global_cfg_.auto_calibrate_on_activate =
     (get_hw_param_int(info_, "auto_calibrate", 0) == 1);
   global_cfg_.gpio_states_topic =
     get_hw_param_str(info_, "gpio_states_topic", "gpio_states");
   global_cfg_.encoder_overflow_threshold =
     static_cast<std::int16_t>(get_hw_param_int(info_, "encoder_overflow_threshold", 32000));
+  global_cfg_.max_retries =
+    static_cast<std::int16_t>(get_hw_param_int(info_, "max_retries", 0));
+  // Resolve the SET_ORIGIN_MODE CAN payload form.
+  //   "temporary" (default): servo-mode 1-byte 0x00 -- not persisted to NVM
+  //   "permanent":           servo-mode 1-byte 0x01 -- persisted to NVM
+  //   "restore":             servo-mode 1-byte 0x02 -- restore factory zero
+  //   "legacy":              MIT-mode 8-byte 0xFF..0xFE form (older firmware)
+  {
+    const std::string mode =
+      get_hw_param_str(info_, "set_origin_mode", "temporary"); // @todo ephson add this in the urdf
+    if (mode == "temporary") {
+      set_origin_payload_ = {SET_ORIGIN_TEMPORARY, 1};
+    } else if (mode == "permanent") {
+      set_origin_payload_ = {SET_ORIGIN_PERMANENT, 1};
+    } else if (mode == "restore") {
+      set_origin_payload_ = {SET_ORIGIN_RESTORE, 1};
+    } else if (mode == "legacy") {
+      set_origin_payload_ = {SETZEROPOSCMD, 8};
+    } else {
+      RCLCPP_FATAL(
+        rclcpp::get_logger("CubeMarsSystemHardware"),
+        "Unknown set_origin_mode '%s'. Valid: temporary|permanent|restore|legacy",
+        mode.c_str());
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                "Using set_origin_mode='%s' (%u-byte payload)",
+                mode.c_str(), set_origin_payload_.len);
+  }
 
   // -------------------- resize per-joint vectors --------------------
   const std::size_t n = info_.joints.size();
@@ -185,7 +214,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     // Required when use_meters_ is set; ignored otherwise.
     if (use_meters_) {
       const double lead_pitch =
-        get_joint_param_double(joint, "lead_pitch", 0.0); // TODO: @EPHSON
+        get_joint_param_double(joint, "lead_pitch", 0.0);
       if (lead_pitch <= 0.0) {
         RCLCPP_ERROR(
           rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -256,7 +285,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
           "Joint %s: calibration_position_tolerance must be > 0", joint.name.c_str());
         return hardware_interface::CallbackReturn::ERROR;
       }
-      // GPIO sensor requires both names if use_limit_sensor_ is on AND the joint
+      // GPIO sensor requires both names if global_cfg_.use_limit_sensor is on AND the joint
       // declares one. Mixed config is OK (some joints use sensor, others fall
       // back to torque+timeout).
       const bool gpio_partial =
@@ -269,7 +298,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
         return hardware_interface::CallbackReturn::ERROR;
       }
       const bool will_use_sensor =
-        use_limit_sensor_ && !cfg.gpio_sensor_name.empty();
+        global_cfg_.use_limit_sensor && !cfg.gpio_sensor_name.empty();
       if (!will_use_sensor && cfg.stall_torque <= 0.0) {
         RCLCPP_WARN(
           rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -300,13 +329,18 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     std::bind(&CubeMarsSystemHardware::motor_control_callback, this,
               std::placeholders::_1, std::placeholders::_2));
 
-    if (use_limit_sensor_) {
+    if (global_cfg_.use_limit_sensor) {
       sub_gpio_states_ = node_->create_subscription<ControlMessage>(
         global_cfg_.gpio_states_topic,
         rclcpp::SystemDefaultsQoS(),
         std::bind(&CubeMarsSystemHardware::process_gpio_message,
                   this, std::placeholders::_1));
     }
+
+    s_publisher_ = node_->create_publisher<MotorCommandGrp>(
+      "lift_platform/status", rclcpp::SystemDefaultsQoS());
+    state_publisher_ =
+      std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
 
     // Register the custom node into the ControllerManager's executor hierarchy
     try {
@@ -316,11 +350,6 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
                    "Failed to add internal node to executor: %s", e.what());
       return hardware_interface::CallbackReturn::ERROR;
     }
-
-    s_publisher_ = get_node()->create_publisher<MotorCommandGrp>(
-      "lift_platform_status", rclcpp::SystemDefaultsQoS());
-    state_publisher_ =
-      std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
 
     RCLCPP_INFO(node_->get_logger(), "Successfully registered internal node and hooks to executor.");
   }
@@ -541,16 +570,14 @@ void CubeMarsSystemHardware::set_phase(std::size_t i, CalibrationPhase p)
   calibration_rt_[i].phase = p;
   calibration_rt_[i].phase_started = now;
   calibration_rt_[i].last_step = now;
-  calibration_rt_[i].zero_cmd_pending = false;
   calibration_rt_[i].limit_sensor_seen = false;
 }
 
 void CubeMarsSystemHardware::issue_zero_command(std::size_t i)
 {
-  // Stop any motion before zeroing.
-  can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
   // Set encoder origin.
-  can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8, SETZEROPOSCMD, 8);
+  can_.write_message(can_ids_[i] | SET_ORIGIN_MODE << 8,
+                     set_origin_payload_.data, set_origin_payload_.len);
   calibration_rt_[i].zero_issued = std::chrono::steady_clock::now();
   calibration_rt_[i].zero_cmd_pending = true;
 }
@@ -585,10 +612,10 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
       // joint units so we can compare apples to apples.
       const double overflow_thresh_units =
         (global_cfg_.encoder_overflow_threshold * 0.1 * M_PI / 180.0) *
-        (use_meters_ ? 0.01 : 1.0);
+        (use_meters_ ? m_per_rad_[i] : 1.0);
 
       const bool gpio_active =
-        use_limit_sensor_ && !cfg.gpio_sensor_name.empty();
+        global_cfg_.use_limit_sensor && !cfg.gpio_sensor_name.empty();
       bool bottom_found = false;
 
       if (gpio_active) {
@@ -627,28 +654,52 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
       // Otherwise advance the setpoint by one search step (paced).
       if (now - rt.last_step >= cfg.step_period) {
         rt.commanded_setpoint += -dir_up * cfg.search_step;
+        if(std::abs(rt.commanded_setpoint) > hardware_limits_[i].range)
+        {
+          rt.commanded_setpoint = -dir_up * hardware_limits_[i].range;
+        }
         rt.last_step = now;
       }
       return rt.commanded_setpoint;
     }
 
     case CalibrationPhase::SET_BOTTOM_ZERO: {
-      issue_zero_command(i);
-      // After settle, the encoder reads ~0 at the bottom.
-      // Next phase commands the midpoint in the (new) raw frame.
+      // First entry into this phase: issue the zero command and return.
+      // Subsequent entries are gated by the settle-window check at the top
+      // of step_calibration; only after settle elapses do we reach here
+      // again and do the actual phase-exit work.
+      if (rt.zero_issued < rt.phase_started) {
+        issue_zero_command(i);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      // Settle elapsed — encoder should now read ~0 at the bottom.
+      // Stage the midpoint setpoint and transition.
       rt.commanded_setpoint = dir_up * half_range;
       set_phase(i, CalibrationPhase::FIND_MIDSECTION);
       return std::numeric_limits<double>::quiet_NaN();
     }
 
+    case CalibrationPhase::SET_RETRY_ZERO: {
+      if (rt.zero_issued < rt.phase_started) {
+        issue_zero_command(i);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      // After settle, the encoder reads ~0 at the bottom.
+      // Next phase commands the midpoint in the (new) raw frame.
+      set_phase(i, CalibrationPhase::FIND_ROOT);
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+
     case CalibrationPhase::FIND_MIDSECTION: {
       // Drive to mid in the raw frame. enc_offs_ is still 0 here so reported
-      // position == raw position.
-      const double err = rt.commanded_setpoint - hw_states_positions_[i];
+      // position == unit converted position.
+      const double err = std::abs(rt.commanded_setpoint) - std::abs(hw_states_positions_[i]);
       if (std::abs(err) < cfg.position_tolerance) {
         set_phase(i, CalibrationPhase::SET_MID_ZERO);
         return std::numeric_limits<double>::quiet_NaN();
       }
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 500,
+                  "Commanded pos: %f Cur pos: %f Err: %f", rt.commanded_setpoint, hw_states_positions_[i]);
       // Phase timeout protects against the lift never reaching mid.
       if (now - rt.phase_started >= cfg.phase_timeout) {
         RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -660,7 +711,12 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
     }
 
     case CalibrationPhase::SET_MID_ZERO: {
-      issue_zero_command(i);
+      // First entry: issue the zero command and return. Subsequent entries
+      // gated by settle window (see SET_BOTTOM_ZERO).
+      if (rt.zero_issued < rt.phase_started) {
+        issue_zero_command(i);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
       // Compute the offset. After zeroing at the midpoint, raw encoder == 0
       // physically corresponds to the midpoint. We want reported position
       // == 0 at the *bottom*, so reported = raw - offset, and at the bottom:
@@ -669,7 +725,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
       enc_offs_[i] = -dir_up * half_range;
       // Drive to the bottom in the raw frame; reported position will then
       // become 0 as we arrive.
-      rt.commanded_setpoint = -dir_up * half_range;
+      rt.commanded_setpoint = 0.0;
       set_phase(i, CalibrationPhase::RETURN_TO_HOME);
       return std::numeric_limits<double>::quiet_NaN();
     }
@@ -750,6 +806,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     const double pos_output =
       use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
     hw_states_positions_[i] = pos_output - enc_offs_[i];
+    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
+                  "Joint %zu: pos-raw: %i pos-rad: %f pos-output: %f pos-hdw: %f", i, pos_raw, pos_rad, pos_output, hw_states_positions_[i]);
  
     // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
     //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
@@ -762,7 +820,7 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
     hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
     RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
-                  "Raw Current %zu: Effort: %f", curr_raw*0.01, hw_states_efforts_[i]);
+                  "Raw Current %f: Effort: %f", (curr_raw*0.01), hw_states_efforts_[i]);
  
     hw_states_temperatures_[i] = static_cast<double>(temp_raw);
 
@@ -810,15 +868,20 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
   // Order matters: set is_calibration_running_ BEFORE clearing has_request_
   // so other readers don't see a brief window with neither flag set.
   if (has_request_.load()) {
+    RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Has Request");
     std::vector<MotorCommandMsg> latest_cmd = command_mailbox_.get();
     bool any_calibration = false;
     bool any_state_change = false;
 
     for (std::size_t i = 0; i < info_.joints.size(); i++) {
       if (i >= latest_cmd.size()) break;
+      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Size OK");
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
+                  "Internal motor id: %i Commanded Id: %i", motor_msgs_[i].can_id, latest_cmd[i].can_id);
       if (motor_msgs_[i].can_id != latest_cmd[i].can_id) continue;
 
       if (latest_cmd[i].calibrate && calibration_cfg_[i].enabled) {
+        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Entering Calibration mode");
         enter_calibration(i);
         any_calibration = true;
       } else {
@@ -848,6 +911,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     // controller is commanding.
     const bool joint_calibrating =
       is_calibration_running_.load() && motor_msgs_[i].calibrate;
+    // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
+    //               "User req: %b Trigger: %b Jt Calib flag: %b", motor_msgs_[i].calibrate, is_calibration_running_.load(), joint_calibrating);
 
     if (joint_calibrating) {
       // Calibration runs ONLY in POSITION_SPEED_LOOP. If the controller hasn't
@@ -860,7 +925,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
                           "Joint %zu: calibration requires position control mode "
                           "(current=%d); aborting", i, control_mode_[i]);
         set_phase(i, CalibrationPhase::FAILED);
-      } else {
+      } 
+      else {
         const double cal_cmd = step_calibration(i);
 
         // FAILED terminates this joint: stop motion, mark uncalibrated, move on.
@@ -884,10 +950,19 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
             static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
             
           if (std::abs(position) >= 360000000) {
+            RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                         "command %f: enc_off %f: cmd_w_enc %f: m_per_rad %f", cal_cmd, enc_offs_[i], cmd_with_off, m_per_rad_[i]);
             RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                          "Joint %zu: calibration position command out of range: %d",
                          i, position);
-            set_phase(i, CalibrationPhase::FAILED);
+            if(retry_cnt_ >= global_cfg_.max_retries) 
+              set_phase(i, CalibrationPhase::FAILED);
+            else {
+              retry_cnt_ += 1;
+              RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                         "Retry %u of %u", retry_cnt_, global_cfg_.max_retries);
+              set_phase(i, CalibrationPhase::SET_RETRY_ZERO);
+            }
             continue;
           }
           const std::int16_t vel = limits_[i].first;
@@ -1014,6 +1089,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         data[4] = vel >> 8;       data[5] = vel;
         data[6] = acc >> 8;       data[7] = acc;
         can_.write_message(can_ids_[i] | POSITION_SPEED_LOOP << 8, data, 8);
+        RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 3000,
+                  "Raw Position %zu: Vel: %zu Acc: %zu", position, vel, acc);
         break;
       }
 
