@@ -106,7 +106,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   //   "legacy":              MIT-mode 8-byte 0xFF..0xFE form (older firmware)
   {
     const std::string mode =
-      get_hw_param_str(info_, "set_origin_mode", "temporary"); // @todo ephson add this in the urdf
+      get_hw_param_str(info_, "set_origin_mode", "temporary");
     if (mode == "temporary") {
       set_origin_payload_ = {SET_ORIGIN_TEMPORARY, 1};
     } else if (mode == "permanent") {
@@ -694,12 +694,13 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
       // Drive to mid in the raw frame. enc_offs_ is still 0 here so reported
       // position == unit converted position.
       const double err = std::abs(rt.commanded_setpoint) - std::abs(hw_states_positions_[i]);
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 500,
+                  "Commanded pos: %f Cur pos: %f Err: %f", rt.commanded_setpoint, hw_states_positions_[i], err);
       if (std::abs(err) < cfg.position_tolerance) {
         set_phase(i, CalibrationPhase::SET_MID_ZERO);
         return std::numeric_limits<double>::quiet_NaN();
       }
-      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 500,
-                  "Commanded pos: %f Cur pos: %f Err: %f", rt.commanded_setpoint, hw_states_positions_[i]);
+      
       // Phase timeout protects against the lift never reaching mid.
       if (now - rt.phase_started >= cfg.phase_timeout) {
         RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -802,12 +803,12 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     //   raw → output radians: pos_raw * 0.1 * π/180
     //   If use_meters_: multiply by m_per_rad_ (lead-screw factor).
     //   Then subtract enc_offs_, which is in output units (m or rad).
+    const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
     const double pos_rad = pos_raw * 0.1 * M_PI / 180.0;
-    const double pos_output =
-      use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
-    hw_states_positions_[i] = pos_output - enc_offs_[i];
+    const double pos_output = use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
+    hw_states_positions_[i] = (pos_output - enc_offs_[i]) * dir_up;
     RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
-                  "Joint %zu: pos-raw: %i pos-rad: %f pos-output: %f pos-hdw: %f", i, pos_raw, pos_rad, pos_output, hw_states_positions_[i]);
+                  "Joint %zu: pos-output: %f enc_offs: %f pos-hdw: %f", i, pos_output, enc_offs_[i], hw_states_positions_[i]);
  
     // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
     //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
@@ -946,6 +947,11 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
           // then scale to wire centidegree-LSB (× 1e4 × 180/π).
           double cmd_with_off = cal_cmd + enc_offs_[i];
           if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
+
+          RCLCPP_INFO_THROTTLE(
+            rclcpp::get_logger("CubeMarsSystemHardware"),
+            *node_->get_clock(), 1000,
+            "Joint %zu: exec command - cal_cmd %f: cmd_w_off %f enc_off %f", i, cal_cmd, cmd_with_off, enc_offs_[i]);
           const std::int32_t position =
             static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
             
@@ -1043,7 +1049,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         if (std::isnan(hw_commands_positions_[i])) break;
         // Add the offset in output units, convert to output radians via the
         // lead-screw factor (if meters), then scale to wire centidegree-LSB.
-        double cmd_with_off = hw_commands_positions_[i] + enc_offs_[i];
+        const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
+        double cmd_with_off = (dir_up * hw_commands_positions_[i]) + enc_offs_[i];
         if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
         const std::int32_t position =
           static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
@@ -1063,7 +1070,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case POSITION_SPEED_LOOP: {
         if (std::isnan(hw_commands_positions_[i])) break;
-        double cmd = hw_commands_positions_[i];
+        const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
+        double cmd = hw_commands_positions_[i] * dir_up;
 
         // Operational clamp: post-calibration, valid range is [0, range].
         if (motor_msgs_[i].is_calibrated && hardware_limits_[i].range > 0.0) {
@@ -1074,6 +1082,12 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         // lead-screw factor (if meters), then scale to wire centidegree-LSB.
         double cmd_with_off = cmd + enc_offs_[i];
         if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
+
+        RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("CubeMarsSystemHardware"),
+        *node_->get_clock(), 1000,
+        "Joint %zu: exec command - cmd %f: cmd_w_off %f enc_off %f", i, cmd, cmd_with_off, enc_offs_[i]);
+
         const std::int32_t position =
           static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
         if (std::abs(position) >= 360000000) {
