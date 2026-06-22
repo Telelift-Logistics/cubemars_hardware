@@ -94,7 +94,9 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   global_cfg_.auto_calibrate_on_activate =
     (get_hw_param_int(info_, "auto_calibrate", 0) == 1);
   global_cfg_.gpio_states_topic =
-    get_hw_param_str(info_, "gpio_states_topic", "gpio_states");
+    get_hw_param_str(info_, "gpio_states_topic", "gpio_controller/gpio_states");
+    global_cfg_.status_topic =
+    get_hw_param_str(info_, "status_topic", "controller/status");
   global_cfg_.encoder_overflow_threshold =
     static_cast<std::int16_t>(get_hw_param_int(info_, "encoder_overflow_threshold", 32000));
   global_cfg_.max_retries =
@@ -338,7 +340,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     }
 
     s_publisher_ = node_->create_publisher<MotorCommandGrp>(
-      std::string(node_->get_name() + std::string("/status")), rclcpp::SystemDefaultsQoS());
+      std::string(global_cfg_.status_topic), rclcpp::SystemDefaultsQoS());
     state_publisher_ =
       std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
 
@@ -470,18 +472,27 @@ hardware_interface::return_type CubeMarsSystemHardware::prepare_command_mode_swi
         joint_interfaces.insert(key.substr(key.find("/") + 1));
       }
     }
+
+    control_mode_t resolved;
     if (joint_interfaces == eff) {
-      start_modes_.push_back(CURRENT_LOOP);
+      resolved = CURRENT_LOOP;
     } else if (joint_interfaces == vel) {
-      start_modes_.push_back(SPEED_LOOP);
+      resolved = SPEED_LOOP;
     } else if (joint_interfaces == pos) {
-      start_modes_.push_back(
-        (limits_[i].first == 0 || limits_[i].second == 0) ? POSITION_LOOP : POSITION_SPEED_LOOP);
+      resolved = (limits_[i].first == 0 || limits_[i].second == 0)
+                   ? POSITION_LOOP : POSITION_SPEED_LOOP;
     } else if (joint_interfaces.empty()) {
-      start_modes_.push_back(stop_modes_[i] ? UNDEFINED : control_mode_[i]);
+      resolved = stop_modes_[i] ? UNDEFINED : control_mode_[i];
     } else {
+      RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                   "Joint %zu (%s): unrecognized interface combination, "
+                   "rejecting mode switch", i, info_.joints[i].name.c_str());
       return hardware_interface::return_type::ERROR;
     }
+    RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                "Joint %zu (%s): resolved mode = %d",
+                i, info_.joints[i].name.c_str(), resolved);
+    start_modes_.push_back(resolved);
   }
   return hardware_interface::return_type::OK;
 }
@@ -807,8 +818,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     const double pos_rad = pos_raw * 0.1 * M_PI / 180.0;
     const double pos_output = use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
     hw_states_positions_[i] = (pos_output - enc_offs_[i]) * dir_up;
-    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
-                  "Joint %zu: pos-output: %f enc_offs: %f pos-hdw: %f", i, pos_output, enc_offs_[i], hw_states_positions_[i]);
+    // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
+    //               "Joint %zu: pos-output: %f enc_offs: %f pos-hdw: %f", i, pos_output, enc_offs_[i], hw_states_positions_[i]);
  
     // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
     //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
@@ -820,8 +831,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     // Effort: raw is centi-amps; multiply by Kt and gear ratio.
     const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
     hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
-    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
-                  "Raw Current %f: Effort: %f", (curr_raw*0.01), hw_states_efforts_[i]);
+    // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
+    //               "Raw Current %f: Effort: %f", (curr_raw*0.01), hw_states_efforts_[i]);
  
     hw_states_temperatures_[i] = static_cast<double>(temp_raw);
 
@@ -853,9 +864,11 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     }
   }
 
-  motor_msg_grp_.header.stamp = node_->get_clock()->now();
-  state_publisher_->try_publish(motor_msg_grp_);
-  motor_msg_grp_.commands.clear();
+  if(!motor_msg_grp_.commands.empty()) {
+    motor_msg_grp_.header.stamp = node_->get_clock()->now();
+    state_publisher_->try_publish(motor_msg_grp_);
+    motor_msg_grp_.commands.clear();
+  }
 
   return hardware_interface::return_type::OK;
 }
@@ -919,15 +932,21 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     if (joint_calibrating) {
       // Calibration runs ONLY in POSITION_SPEED_LOOP. If the controller hasn't
       // claimed position interfaces, we cannot safely move the joint; mark it
-      // FAILED rather than silently doing nothing.
       if (control_mode_[i] != POSITION_SPEED_LOOP &&
           control_mode_[i] != POSITION_LOOP)
       {
-        RCLCPP_ERROR_ONCE(rclcpp::get_logger("CubeMarsSystemHardware"),
-                          "Joint %zu: calibration requires position control mode "
-                          "(current=%d); aborting", i, control_mode_[i]);
-        set_phase(i, CalibrationPhase::FAILED);
-      } 
+        // Wait for the position controller to claim interfaces. Re-stamp
+        // phase_started so the FIND_ROOT timeout doesn't tick down while we
+        // wait. Throttle-warn so a controller that never comes up is visible
+        // in the logs.
+        calibration_rt_[i].phase_started = std::chrono::steady_clock::now();
+        RCLCPP_WARN_THROTTLE(
+          rclcpp::get_logger("CubeMarsSystemHardware"),
+          *node_->get_clock(), 2000,
+          "Joint %zu: calibration waiting for position control mode "
+          "(current=%d)", i, control_mode_[i]);
+        continue;
+      }
       else {
         const double cal_cmd = step_calibration(i);
 
@@ -949,10 +968,10 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
           double cmd_with_off = cal_cmd + enc_offs_[i];
           if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
 
-          RCLCPP_INFO_THROTTLE(
-            rclcpp::get_logger("CubeMarsSystemHardware"),
-            *node_->get_clock(), 1000,
-            "Joint %zu: exec command - cal_cmd %f: cmd_w_off %f enc_off %f", i, cal_cmd, cmd_with_off, enc_offs_[i]);
+          // RCLCPP_INFO_THROTTLE(
+          //   rclcpp::get_logger("CubeMarsSystemHardware"),
+          //   *node_->get_clock(), 1000,
+          //   "Joint %zu: exec command - cal_cmd %f: cmd_w_off %f enc_off %f", i, cal_cmd, cmd_with_off, enc_offs_[i]);
           const std::int32_t position =
             static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
             
@@ -1072,22 +1091,23 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
       case POSITION_SPEED_LOOP: {
         if (std::isnan(hw_commands_positions_[i])) break;
         const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
-        double cmd = hw_commands_positions_[i] * dir_up;
+        double cmd = hw_commands_positions_[i];
 
         // Operational clamp: post-calibration, valid range is [0, range].
         if (motor_msgs_[i].is_calibrated && hardware_limits_[i].range > 0.0) {
           if (cmd < 0.0) cmd = 0.0;
           if (cmd > hardware_limits_[i].range) cmd = hardware_limits_[i].range;
         }
+        cmd = cmd * dir_up;
         // Add the offset in output units, convert to output radians via the
         // lead-screw factor (if meters), then scale to wire centidegree-LSB.
         double cmd_with_off = cmd + enc_offs_[i];
         if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
 
-        RCLCPP_INFO_THROTTLE(
-        rclcpp::get_logger("CubeMarsSystemHardware"),
-        *node_->get_clock(), 1000,
-        "Joint %zu: exec command - cmd %f: cmd_w_off %f enc_off %f", i, cmd, cmd_with_off, enc_offs_[i]);
+        // RCLCPP_INFO_THROTTLE(
+        // rclcpp::get_logger("CubeMarsSystemHardware"),
+        // *node_->get_clock(), 1000,
+        // "Joint %zu: exec command - cmd %f: cmd_w_off %f enc_off %f", i, cmd, cmd_with_off, enc_offs_[i]);
 
         const std::int32_t position =
           static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
@@ -1104,8 +1124,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         data[4] = vel >> 8;       data[5] = vel;
         data[6] = acc >> 8;       data[7] = acc;
         can_.write_message(can_ids_[i] | POSITION_SPEED_LOOP << 8, data, 8);
-        RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 3000,
-                  "Raw Position %zu: Vel: %zu Acc: %zu", position, vel, acc);
+        // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 3000,
+        //           "Raw Position %zu: Vel: %zu Acc: %zu", position, vel, acc);
         break;
       }
 
