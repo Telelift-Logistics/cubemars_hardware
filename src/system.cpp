@@ -338,7 +338,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     }
 
     s_publisher_ = node_->create_publisher<MotorCommandGrp>(
-      "lift_platform/status", rclcpp::SystemDefaultsQoS());
+      std::string(node_->get_name() + std::string("/status")), rclcpp::SystemDefaultsQoS());
     state_publisher_ =
       std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
 
@@ -853,6 +853,7 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     }
   }
 
+  motor_msg_grp_.header.stamp = node_->get_clock()->now();
   state_publisher_->try_publish(motor_msg_grp_);
   motor_msg_grp_.commands.clear();
 
