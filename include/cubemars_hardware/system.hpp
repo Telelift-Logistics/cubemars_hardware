@@ -203,7 +203,7 @@ private:
   {
     bool auto_calibrate_on_activate{false};
     /// Topic to subscribe to for GPIO limit-sensor states.
-    std::string gpio_states_topic{"gpio_states"};
+    std::string gpio_states_topic{"gpio_controller/gpio_states"}, status_topic{"controller/status"};
     /// Hard ceiling on int16 encoder count where we declare "overflow imminent".
     /// CubeMars reports position as int16 centidegrees; ±32000 ≈ ±320°.
     std::int16_t encoder_overflow_threshold{32000};
