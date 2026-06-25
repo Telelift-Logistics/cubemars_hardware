@@ -144,7 +144,7 @@ private:
     const std::shared_ptr<MotorControlServiceRequest> request,
     std::shared_ptr<MotorControlServiceResponse> response);
 
-  /// @brief Process a GPIO message and update per-joint limit_sensor_seen
+  /// @brief Process a GPIO states message and update per-joint limit sensor seen
   /// flags in calibration_rt_.
   void process_gpio_message(const ControlMessage & msg);
 
@@ -174,11 +174,16 @@ private:
   /// through HardwareComponentInterfaceParams). The CM spins our `node_`
   /// for us; we do NOT spawn our own thread.
   std::weak_ptr<rclcpp::Executor> executor_weak_;
-
-  std::unique_ptr<realtime_tools::RealtimePublisher<MotorCommandGrp>> state_publisher_;
+  
+  /// @brief Realtime motor status publisher
+  std::unique_ptr<realtime_tools::RealtimePublisher<MotorCommandGrp>> rt_state_publisher_;
   std::shared_ptr<rclcpp::Publisher<MotorCommandGrp>> s_publisher_;
   std::vector<MotorCommandMsg> motor_msgs_;
   MotorCommandGrp motor_msg_grp_;
+
+  /// @brief Realtime SAFE stop publisher
+  std::unique_ptr<realtime_tools::RealtimePublisher<ControlMessage>> rt_pub_gpio_command_;
+   std::shared_ptr<rclcpp::Publisher<ControlMessage>> pub_gpio_command_;
 
   // ---- top-level flags ----
   std::atomic<bool> is_calibration_running_{false};
@@ -202,8 +207,21 @@ private:
   struct GlobalCalibrationCfg
   {
     bool auto_calibrate_on_activate{false};
-    /// Topic to subscribe to for GPIO limit-sensor states.
-    std::string gpio_states_topic{"gpio_controller/gpio_states"}, status_topic{"controller/status"};
+    /// @brief Topic to subscribe to for GPIO sensor states.
+    std::string gpio_states_topic{"gpio_controller/gpio_states"};
+    /// @brief to publish GPIO commands.
+    std::string gpio_cmd_topic{"gpio_controller/commands"};
+    /// @brief Topic for publishing Lift motor states
+    std::string status_topic{"lift_position_controller/status"};
+    /// @brief Empty power sensor name disables GPIO check (only telemetry timeout is used).
+    std::string gpio_power_group_name{};
+    std::string gpio_power_ifc_name{};
+    /// @brief Lower Limit Sensor (INPUT)
+    std::string gpio_limit_group_name{};
+    std::string gpio_limit_ifc_name{};
+    /// @brief SAFE Stop "STOP_LIFT" (OUTPUT)
+    std::string gpio_stop_lift_group_name{};
+    std::string gpio_stop_lift_ifc_name{};
     /// Hard ceiling on int16 encoder count where we declare "overflow imminent".
     /// CubeMars reports position as int16 centidegrees; ±32000 ≈ ±320°.
     std::int16_t encoder_overflow_threshold{32000};
@@ -211,8 +229,42 @@ private:
     bool use_limit_sensor{false};
     /// Number of calibration retry attempts
     std::int16_t max_retries;
+
+    /// Telemetry-timeout fallback for power-loss detection.
+    std::chrono::milliseconds power_loss_timeout{500};
+
+    /// How many consecutive good telemetry frames must arrive before
+    /// declaring the lift RECOVERING (debounce against transient blips).
+    int min_telemetry_frames_to_resume{3};
+
+    /// @brief On transition RECOVERING → calibrating, run calibration automatically
+    /// (true) or wait for a service request (false).
+    bool auto_recalibrate_on_power_restore{true};
   } global_cfg_;
   uint16_t retry_cnt_{0};
+
+  // ---- lift power state tracking ----
+  std::atomic<LiftPowerState> lift_power_state_{LiftPowerState::ONLINE};
+  std::atomic<bool> gpio_power_seen_high_{true};  // latched from GPIO callback
+  std::vector<std::chrono::steady_clock::time_point> last_telemetry_;
+  std::vector<int> good_frames_since_offline_;
+
+  /// @brief Evaluate GPIO + telemetry timestamps and update lift_power_state_.
+  /// Called from read() each cycle.
+  void update_power_state();
+
+  /// @brief Clear all per-joint state that is invalidated by a power loss
+  /// (calibration, encoder offset, mailbox, pending requests).
+  void enter_offline_state();
+
+  /// @brief On transition from OFFLINE → RECOVERING: either auto-queue a
+  /// calibration request or just log that we're awaiting one.
+  void enter_recovering_state();
+
+  /// @brief Publisher to trigger SAFE stop.
+  /// Called from read() each cycle.
+  void enter_safe_state();
+
 };
 
 }  // namespace cubemars_hardware

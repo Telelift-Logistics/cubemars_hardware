@@ -91,6 +91,29 @@ namespace cubemars_hardware
     }
 
     // ---------------------------------------------------------------------------
+    // Hardware-wide lift power state
+    // ---------------------------------------------------------------------------
+    /// @brief Top-level state of the lift power. Distinct from per-joint
+    /// calibration state. Transitions are driven from read() based on GPIO
+    /// power-state input and telemetry timeout.
+    enum struct LiftPowerState : std::uint8_t
+    {
+        ONLINE = 0,      // power on, telemetry flowing, normal operation
+        OFFLINE = 1,     // power confirmed off via GPIO or telemetry timeout
+        RECOVERING = 2,  // telemetry just resumed; awaiting (re)calibration
+    };
+
+    inline const char * to_string(LiftPowerState s)
+    {
+        switch (s) {
+            case LiftPowerState::ONLINE:     return "ONLINE";
+            case LiftPowerState::OFFLINE:    return "OFFLINE";
+            case LiftPowerState::RECOVERING: return "RECOVERING";
+        }
+        return "UNKNOWN";
+    }
+
+    // ---------------------------------------------------------------------------
     // Per-joint static calibration configuration (parsed from URDF on init)
     // ---------------------------------------------------------------------------
     /// @brief Static, joint-specific calibration tuning loaded from URDF.
@@ -133,7 +156,7 @@ namespace cubemars_hardware
         /// Name of the GPIO interface providing the lower-limit-sensor reading
         /// for this joint inside the gpio_state_msg interface group. Empty
         /// means no per-joint sensor.
-        std::string gpio_sensor_name{};
+        std::string gpio_ifc_name{};
 
         /// Name of the GPIO interface group containing `gpio_sensor_name`.
         /// Empty means no per-joint sensor.

@@ -89,18 +89,23 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  use_meters_       = (get_hw_param_int(info_, "use_meters", 0) == 1);
-  global_cfg_.use_limit_sensor = (get_hw_param_int(info_, "use_limit_sensor", 0) == 1);
-  global_cfg_.auto_calibrate_on_activate =
-    (get_hw_param_int(info_, "auto_calibrate", 0) == 1);
-  global_cfg_.gpio_states_topic =
-    get_hw_param_str(info_, "gpio_states_topic", "gpio_controller/gpio_states");
+  {
+    use_meters_       = (get_hw_param_int(info_, "use_meters", 0) == 1);
+    global_cfg_.use_limit_sensor = (get_hw_param_int(info_, "use_limit_sensor", 0) == 1);
+    global_cfg_.auto_calibrate_on_activate =
+      (get_hw_param_int(info_, "auto_calibrate", 0) == 1);
+    global_cfg_.gpio_states_topic =
+      get_hw_param_str(info_, "gpio_states_topic", "gpio_controller/gpio_states");
+    global_cfg_.gpio_cmd_topic =
+      get_hw_param_str(info_, "gpio_cmd_topic", "gpio_controller/commands");
     global_cfg_.status_topic =
-    get_hw_param_str(info_, "status_topic", "controller/status");
-  global_cfg_.encoder_overflow_threshold =
-    static_cast<std::int16_t>(get_hw_param_int(info_, "encoder_overflow_threshold", 32000));
-  global_cfg_.max_retries =
-    static_cast<std::int16_t>(get_hw_param_int(info_, "max_retries", 0));
+      get_hw_param_str(info_, "status_topic", "lift_position_controller/status");
+    global_cfg_.encoder_overflow_threshold =
+      static_cast<std::int16_t>(get_hw_param_int(info_, "encoder_overflow_threshold", 32000));
+    global_cfg_.max_retries =
+      static_cast<std::int16_t>(get_hw_param_int(info_, "max_retries", 0));
+  }
+
   // Resolve the SET_ORIGIN_MODE CAN payload form.
   //   "temporary" (default): servo-mode 1-byte 0x00 -- not persisted to NVM
   //   "permanent":           servo-mode 1-byte 0x01 -- persisted to NVM
@@ -129,6 +134,42 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
                 mode.c_str(), set_origin_payload_.len);
   }
 
+  // Lift power monitoring/ SAFE stop triggering
+  {
+    global_cfg_.gpio_power_group_name =
+      get_hw_param_str(info_, "gpio_power_group_name", "");
+    global_cfg_.gpio_power_ifc_name =
+      get_hw_param_str(info_, "gpio_power_ifc_name", "");
+    if (global_cfg_.gpio_power_group_name.empty() !=
+        global_cfg_.gpio_power_ifc_name.empty())
+    {
+      RCLCPP_FATAL(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "gpio_power_group_name and gpio_power_ifc_name must be "
+                  "set together (or both empty to disable GPIO check for Lift power state)");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    global_cfg_.gpio_stop_lift_group_name =
+      get_hw_param_str(info_, "gpio_stop_lift_group_name", "");
+    global_cfg_.gpio_stop_lift_ifc_name =
+      get_hw_param_str(info_, "gpio_stop_lift_ifc_name", "");
+    if (global_cfg_.gpio_stop_lift_group_name.empty() !=
+        global_cfg_.gpio_stop_lift_ifc_name.empty())
+    {
+      RCLCPP_FATAL(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "gpio_stop_lift_group_name and gpio_stop_lift_ifc_name must be "
+                  "set together (or both empty to disable SAFE stop publishing)");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    global_cfg_.power_loss_timeout = std::chrono::milliseconds(
+      get_hw_param_int(info_, "power_loss_timeout_ms", 500));
+    global_cfg_.min_telemetry_frames_to_resume =
+      get_hw_param_int(info_, "min_telemetry_frames_to_resume", 3);
+    global_cfg_.auto_recalibrate_on_power_restore =
+      (get_hw_param_int(info_, "auto_recalibrate_on_power_restore", 1) == 1);
+  }
+
   // -------------------- resize per-joint vectors --------------------
   const std::size_t n = info_.joints.size();
   hw_states_positions_.assign(n, std::numeric_limits<double>::quiet_NaN());
@@ -142,6 +183,8 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   control_mode_.assign(n, control_mode_t::UNDEFINED);
   calibration_cfg_.assign(n, CalibrationConfig{});
   calibration_rt_.assign(n, CalibrationRuntime{});
+  last_telemetry_.assign(n, std::chrono::steady_clock::time_point{});
+  good_frames_since_offline_.assign(n, 0);
 
   // -------------------- per-joint parameters --------------------
   for (const hardware_interface::ComponentInfo & joint : info_.joints) {
@@ -264,7 +307,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
                           static_cast<int>(cfg.zero_settle.count())));
 
     cfg.gpio_group_name  = get_joint_param_str(joint, "gpio_group_name", "");
-    cfg.gpio_sensor_name = get_joint_param_str(joint, "gpio_sensor_name", "");
+    cfg.gpio_ifc_name = get_joint_param_str(joint, "gpio_ifc_name", "");
 
     // ---- Validation ----
     if (cfg.enabled) {
@@ -291,16 +334,16 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       // declares one. Mixed config is OK (some joints use sensor, others fall
       // back to torque+timeout).
       const bool gpio_partial =
-        (cfg.gpio_group_name.empty()) != (cfg.gpio_sensor_name.empty());
+        (cfg.gpio_group_name.empty()) != (cfg.gpio_ifc_name.empty());
       if (gpio_partial) {
         RCLCPP_ERROR(
           rclcpp::get_logger("CubeMarsSystemHardware"),
-          "Joint %s: gpio_group_name and gpio_sensor_name must be set together",
+          "Joint %s: gpio_group_name and gpio_ifc_name must be set together",
           joint.name.c_str());
         return hardware_interface::CallbackReturn::ERROR;
       }
       const bool will_use_sensor =
-        global_cfg_.use_limit_sensor && !cfg.gpio_sensor_name.empty();
+        global_cfg_.use_limit_sensor && !cfg.gpio_ifc_name.empty();
       if (!will_use_sensor && cfg.stall_torque <= 0.0) {
         RCLCPP_WARN(
           rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -339,10 +382,19 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
                   this, std::placeholders::_1));
     }
 
-    s_publisher_ = node_->create_publisher<MotorCommandGrp>(
-      std::string(global_cfg_.status_topic), rclcpp::SystemDefaultsQoS());
-    state_publisher_ =
-      std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
+    // Realtime Publisher setup
+    {
+      s_publisher_ = node_->create_publisher<MotorCommandGrp>(
+        std::string(global_cfg_.status_topic), rclcpp::SystemDefaultsQoS());
+      rt_state_publisher_ =
+        std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
+
+      pub_gpio_command_ = node_->create_publisher<ControlMessage>(
+        std::string(global_cfg_.gpio_cmd_topic), rclcpp::SystemDefaultsQoS());
+      rt_pub_gpio_command_ =
+        std::make_unique<realtime_tools::RealtimePublisher<ControlMessage>>(pub_gpio_command_);
+    }
+    
 
     // Register the custom node into the ControllerManager's executor hierarchy
     try {
@@ -626,7 +678,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         (use_meters_ ? m_per_rad_[i] : 1.0);
 
       const bool gpio_active =
-        global_cfg_.use_limit_sensor && !cfg.gpio_sensor_name.empty();
+        global_cfg_.use_limit_sensor && !cfg.gpio_ifc_name.empty();
       bool bottom_found = false;
 
       if (gpio_active) {
@@ -780,6 +832,8 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
 hardware_interface::return_type CubeMarsSystemHardware::read(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
+  const bool offline = (lift_power_state_.load() == LiftPowerState::OFFLINE);
+
   std::vector<bool> all_ids(can_ids_.size(), false);
   std::uint32_t read_id;
   std::uint8_t read_data[8];
@@ -804,54 +858,63 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     const std::size_t i = std::distance(can_ids_.begin(), it);
     all_ids[i] = true;
 
+    last_telemetry_[i] = std::chrono::steady_clock::now();
+    if (offline) {
+      good_frames_since_offline_[i]++;
+    }
+
     const std::int16_t pos_raw  = static_cast<std::int16_t>((read_data[0] << 8) | read_data[1]);
     const std::int16_t vel_raw  = static_cast<std::int16_t>((read_data[2] << 8) | read_data[3]);
     const std::int16_t curr_raw = static_cast<std::int16_t>((read_data[4] << 8) | read_data[5]);
     const std::uint8_t temp_raw = read_data[6];
 
-    // Unit conversions ------------------------------------------------------
-    // Position: pos_raw is in centidegrees (0.1° per LSB) at the output shaft.
-    //   raw → output radians: pos_raw * 0.1 * π/180
-    //   If use_meters_: multiply by m_per_rad_ (lead-screw factor).
-    //   Then subtract enc_offs_, which is in output units (m or rad).
-    const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
-    const double pos_rad = pos_raw * 0.1 * M_PI / 180.0;
-    const double pos_output = use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
-    hw_states_positions_[i] = (pos_output - enc_offs_[i]) * dir_up;
-    // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
-    //               "Joint %zu: pos-output: %f enc_offs: %f pos-hdw: %f", i, pos_output, enc_offs_[i], hw_states_positions_[i]);
- 
-    // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
-    //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
-    //   If use_meters_, scale rad/s → m/s with the lead-screw factor.
-    const double vel_rad_s = vel_raw / erpm_conversions_[i];
-    hw_states_velocities_[i] =
-      use_meters_ ? (vel_rad_s * m_per_rad_[i]) : vel_rad_s;
- 
-    // Effort: raw is centi-amps; multiply by Kt and gear ratio.
-    const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
-    hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
-    // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
-    //               "Raw Current %f: Effort: %f", (curr_raw*0.01), hw_states_efforts_[i]);
- 
-    hw_states_temperatures_[i] = static_cast<double>(temp_raw);
-
-    // ---- Torque-limit handling (operational, NOT calibration) ----
-    // Calibration's own stall threshold is checked inside step_calibration's
-    // FIND_ROOT branch; the operational trq_limit applies only when *not*
-    // calibrating to avoid double-handling.
-    if (trq_limits_[i] != 0 &&
-        std::abs(hw_states_efforts_[i]) > trq_limits_[i] &&
-        !(is_calibration_running_ && motor_msgs_[i].calibrate))
+    if(!offline)
     {
-      RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
-                   "Joint %zu went over torque limit (%f > %f), disabling.",
-                   i, hw_states_efforts_[i], trq_limits_[i]);
-      can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-      motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
-    }
+      // Unit conversions ------------------------------------------------------
+      // Position: pos_raw is in centidegrees (0.1° per LSB) at the output shaft.
+      //   raw → output radians: pos_raw * 0.1 * π/180
+      //   If use_meters_: multiply by m_per_rad_ (lead-screw factor).
+      //   Then subtract enc_offs_, which is in output units (m or rad).
+      const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
+      const double pos_rad = pos_raw * 0.1 * M_PI / 180.0;
+      const double pos_output = use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
+      hw_states_positions_[i] = (pos_output - enc_offs_[i]) * dir_up;
+      // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
+      //               "Joint %zu: pos-output: %f enc_offs: %f pos-hdw: %f", i, pos_output, enc_offs_[i], hw_states_positions_[i]);
+  
+      // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
+      //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
+      //   If use_meters_, scale rad/s → m/s with the lead-screw factor.
+      const double vel_rad_s = vel_raw / erpm_conversions_[i];
+      hw_states_velocities_[i] =
+        use_meters_ ? (vel_rad_s * m_per_rad_[i]) : vel_rad_s;
+  
+      // Effort: raw is centi-amps; multiply by Kt and gear ratio.
+      const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
+      hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
+      // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
+      //               "Raw Current %f: Effort: %f", (curr_raw*0.01), hw_states_efforts_[i]);
+  
+      hw_states_temperatures_[i] = static_cast<double>(temp_raw);
 
-    motor_msg_grp_.commands.push_back(motor_msgs_[i]);
+      // ---- Torque-limit handling (operational, NOT calibration) ----
+      // Calibration's own stall threshold is checked inside step_calibration's
+      // FIND_ROOT branch; the operational trq_limit applies only when *not*
+      // calibrating to avoid double-handling.
+      if (trq_limits_[i] != 0 &&
+          std::abs(hw_states_efforts_[i]) > trq_limits_[i] &&
+          !(is_calibration_running_ && motor_msgs_[i].calibrate)) // @todo Ephson - add publisher here to trigger safestop ***
+      {
+        RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu went over torque limit (%f > %f), disabling.",
+                    i, hw_states_efforts_[i], trq_limits_[i]);
+        can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+        motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+        enter_safe_state();
+      }
+
+      motor_msg_grp_.commands.push_back(motor_msgs_[i]);
+    }
   }
 
   for (std::size_t i = 0; i < info_.joints.size(); i++) {
@@ -864,9 +927,11 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     }
   }
 
+  update_power_state();
+
   if(!motor_msg_grp_.commands.empty()) {
     motor_msg_grp_.header.stamp = node_->get_clock()->now();
-    state_publisher_->try_publish(motor_msg_grp_);
+    rt_state_publisher_->try_publish(motor_msg_grp_);
     motor_msg_grp_.commands.clear();
   }
 
@@ -879,6 +944,19 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
 hardware_interface::return_type CubeMarsSystemHardware::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
+  // While OFFLINE: drop the mailbox if anything's in it, don't send CAN.
+  // Returning OK keeps the controller manager happy and avoids the lifecycle
+  // dance that ERROR would force.
+  if (lift_power_state_.load() == LiftPowerState::OFFLINE) {
+    if (has_request_.load()) {
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),
+                           *node_->get_clock(), 2000,
+                           "Lift OFFLINE: dropping service request");
+      has_request_.store(false);
+    }
+    return hardware_interface::return_type::OK;
+  }
+
   // ---- Consume mailbox once per request ----
   // Order matters: set is_calibration_running_ BEFORE clearing has_request_
   // so other readers don't see a brief window with neither flag set.
@@ -1179,6 +1257,13 @@ void CubeMarsSystemHardware::motor_control_callback(
   const std::shared_ptr<MotorControlServiceRequest> request,
   std::shared_ptr<MotorControlServiceResponse> response)
 {
+  // Reject any commands when Lift is OFFLINE
+   if (lift_power_state_.load() == LiftPowerState::OFFLINE) {
+    response->success = false;
+    response->message = "Lift is OFFLINE (power lost)";
+    return;
+  }
+
   if (has_request_.load() || is_calibration_running_.load() ||
       is_changing_state_.load())
   {
@@ -1238,21 +1323,184 @@ void CubeMarsSystemHardware::process_gpio_message(const ControlMessage & msg)
   for (std::size_t g = 0; g < msg.interface_groups.size(); ++g) {
     const std::string & grp_name = msg.interface_groups[g];
     const auto & ifc_values = msg.interface_values[g];
-
+    
+    // Limit Sensor Handling
     for (std::size_t i = 0; i < info_.joints.size(); ++i) {
       const auto & cfg = calibration_cfg_[i];
-      if (cfg.gpio_group_name.empty() || cfg.gpio_sensor_name.empty()) continue;
+      if (cfg.gpio_group_name.empty() || cfg.gpio_ifc_name.empty()) continue;
       if (cfg.gpio_group_name != grp_name) continue;
 
       for (std::size_t t = 0; t < ifc_values.interface_names.size(); ++t) {
-        if (ifc_values.interface_names[t] == cfg.gpio_sensor_name) {
+        if (ifc_values.interface_names[t] == cfg.gpio_ifc_name) {
           // Floating-point safe comparison: > 0.5 means "pressed/high".
           if (ifc_values.values[t] > 0.5) {
-            calibration_rt_[i].limit_sensor_seen = true;
+            calibration_rt_[i].limit_sensor_seen = true; // @todo Ephson - use this variable in read to stop the lift
           }
         }
       }
     }
+
+    // Hardware-wide power signal.
+    if (!global_cfg_.gpio_power_group_name.empty() &&
+        global_cfg_.gpio_power_group_name == grp_name)
+    {
+      for (std::size_t t = 0; t < ifc_values.interface_names.size(); ++t) {
+        if (ifc_values.interface_names[t] == global_cfg_.gpio_power_ifc_name) {
+          gpio_power_seen_high_.store(ifc_values.values[t] > 0.5);
+        }
+      }
+    }
+  }
+}
+
+void CubeMarsSystemHardware::enter_offline_state()
+{
+  // Clear per-joint state that's invalidated by power loss. We do NOT touch
+  // motor_msgs_[i].can_id or set_origin_payload_ etc. - those are static
+  // hardware config.
+  for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+    motor_msgs_[i].is_calibrated = false;
+    motor_msgs_[i].calibrate = false;
+    enc_offs_[i] = 0.0;
+    // Drop any in-progress calibration runtime.
+    calibration_rt_[i] = CalibrationRuntime{};
+    good_frames_since_offline_[i] = 0;
+    // NaN out the reported state so downstream sees the unknown.
+    hw_states_positions_[i]    = std::numeric_limits<double>::quiet_NaN();
+    hw_states_velocities_[i]   = std::numeric_limits<double>::quiet_NaN();
+    hw_states_efforts_[i]      = std::numeric_limits<double>::quiet_NaN();
+    hw_states_temperatures_[i] = std::numeric_limits<double>::quiet_NaN();
+  }
+  // Drop any pending service request - it was issued under the previous
+  // power-on epoch and is no longer meaningful.
+  has_request_.store(false);
+  is_calibration_running_.store(false);
+  is_changing_state_.store(false);
+
+  RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+              "Lift OFFLINE: clearing calibration, dropping pending commands");
+}
+
+void CubeMarsSystemHardware::enter_recovering_state()
+{
+  RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+              "Lift RECOVERING: telemetry resumed");
+  if (!global_cfg_.auto_recalibrate_on_power_restore) {
+    RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                "Auto-recalibrate disabled; awaiting service request to "
+                "trigger calibration");
+    return;
+  }
+  // Synthesize a calibration request just like on_activate does.
+  std::vector<MotorCommandMsg> auto_cmd(info_.joints.size());
+  bool any = false;
+  for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+    auto_cmd[i].can_id = motor_msgs_[i].can_id;
+    auto_cmd[i].set_motor_state = 0;
+    if (calibration_cfg_[i].enabled) {
+      auto_cmd[i].calibrate = true;
+      any = true;
+    }
+  }
+  if (any) {
+    command_mailbox_.set(auto_cmd);
+    has_request_.store(true);
+    RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                "Auto-recalibration queued");
+  }
+}
+
+void CubeMarsSystemHardware::update_power_state()
+{
+  const auto now = std::chrono::steady_clock::now();
+  const LiftPowerState prev = lift_power_state_.load();
+
+  // GPIO check (primary). When disabled (no name configured) we treat the
+  // signal as "always high" so only telemetry timeout drives the decision.
+  const bool gpio_check_enabled =
+    !global_cfg_.gpio_power_group_name.empty();
+  const bool gpio_high =
+    !gpio_check_enabled || gpio_power_seen_high_.load();
+
+  // Telemetry check (fallback): any joint had a frame within timeout?
+  bool any_recent_telemetry = false;
+  for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+    if (last_telemetry_[i].time_since_epoch().count() == 0) continue;
+    if (now - last_telemetry_[i] < global_cfg_.power_loss_timeout) {
+      any_recent_telemetry = true;
+      break;
+    }
+  }
+
+  LiftPowerState next = prev;
+  switch (prev) {
+    case LiftPowerState::ONLINE:
+      if (!gpio_high || !any_recent_telemetry) {
+        next = LiftPowerState::OFFLINE;
+      }
+      break;
+    case LiftPowerState::OFFLINE:
+      // To leave OFFLINE we need BOTH GPIO high AND telemetry resumption.
+      if (gpio_high && any_recent_telemetry) {
+        // Debounce on min_telemetry_frames_to_resume across joints.
+        bool enough = true;
+        for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+          if (good_frames_since_offline_[i] <
+              global_cfg_.min_telemetry_frames_to_resume)
+          {
+            enough = false;
+            break;
+          }
+        }
+        if (enough) next = LiftPowerState::RECOVERING;
+      }
+      break;
+    case LiftPowerState::RECOVERING:
+      // Drop back to OFFLINE if signals regress.
+      if (!gpio_high || !any_recent_telemetry) {
+        next = LiftPowerState::OFFLINE;
+        break;
+      }
+      // Promote to ONLINE once every enabled joint is calibrated.
+      {
+        bool all_ok = true;
+        for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+          if (calibration_cfg_[i].enabled && !motor_msgs_[i].is_calibrated) {
+            all_ok = false;
+            break;
+          }
+        }
+        if (all_ok) next = LiftPowerState::ONLINE;
+      }
+      break;
+  }
+
+  if (next != prev) {
+    RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                "Lift power state: %s -> %s",
+                to_string(prev), to_string(next));
+    lift_power_state_.store(next);
+    if (next == LiftPowerState::OFFLINE) enter_offline_state();
+    else if (next == LiftPowerState::RECOVERING) enter_recovering_state();
+  }
+}
+
+void CubeMarsSystemHardware::enter_safe_state()
+{
+  if(!global_cfg_.gpio_stop_lift_group_name.empty() &&
+      !global_cfg_.gpio_stop_lift_group_name.empty())
+  {
+    // Create a message to the safety sequence.
+    auto dynamic_interface_group_values_msg = ControlMessage();
+    dynamic_interface_group_values_msg.header.stamp = get_clock()->now();
+    dynamic_interface_group_values_msg.interface_groups.push_back(
+          global_cfg_.gpio_stop_lift_group_name);
+    auto interface_value_msg = control_msgs::msg::InterfaceValue();
+    interface_value_msg.interface_names.push_back(global_cfg_.gpio_stop_lift_ifc_name);
+    interface_value_msg.values.push_back(1);
+    dynamic_interface_group_values_msg.interface_values.push_back(interface_value_msg);
+    // Publish the command (RT).
+    rt_pub_gpio_command_->try_publish(dynamic_interface_group_values_msg);
   }
 }
 
