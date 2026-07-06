@@ -263,7 +263,7 @@ private:
 
   /// @brief Publisher to trigger SAFE stop.
   /// Called from read() each cycle.
-  void enter_safe_state();
+  void enter_safe_state(const bool &set = true);
 
 };
 

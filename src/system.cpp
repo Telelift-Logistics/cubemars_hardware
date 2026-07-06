@@ -903,14 +903,14 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       // calibrating to avoid double-handling.
       if (trq_limits_[i] != 0 &&
           std::abs(hw_states_efforts_[i]) > trq_limits_[i] &&
-          !(is_calibration_running_ && motor_msgs_[i].calibrate)) // @todo Ephson - add publisher here to trigger safestop ***
+          !(is_calibration_running_ && motor_msgs_[i].calibrate))
       {
         RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                     "Joint %zu went over torque limit (%f > %f), disabling.",
                     i, hw_states_efforts_[i], trq_limits_[i]);
         can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
         motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
-        enter_safe_state();
+        enter_safe_state(true);
       }
 
       motor_msg_grp_.commands.push_back(motor_msgs_[i]);
@@ -1377,6 +1377,9 @@ void CubeMarsSystemHardware::enter_offline_state()
   is_calibration_running_.store(false);
   is_changing_state_.store(false);
 
+  // Unset STOP LIFT bit
+  enter_safe_state(false);
+
   RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
               "Lift OFFLINE: clearing calibration, dropping pending commands");
 }
@@ -1485,7 +1488,7 @@ void CubeMarsSystemHardware::update_power_state()
   }
 }
 
-void CubeMarsSystemHardware::enter_safe_state()
+void CubeMarsSystemHardware::enter_safe_state(const bool &set)
 {
   if(!global_cfg_.gpio_stop_lift_group_name.empty() &&
       !global_cfg_.gpio_stop_lift_group_name.empty())
@@ -1497,7 +1500,7 @@ void CubeMarsSystemHardware::enter_safe_state()
           global_cfg_.gpio_stop_lift_group_name);
     auto interface_value_msg = control_msgs::msg::InterfaceValue();
     interface_value_msg.interface_names.push_back(global_cfg_.gpio_stop_lift_ifc_name);
-    interface_value_msg.values.push_back(1);
+    interface_value_msg.values.push_back((set)? 1 : 0);
     dynamic_interface_group_values_msg.interface_values.push_back(interface_value_msg);
     // Publish the command (RT).
     rt_pub_gpio_command_->try_publish(dynamic_interface_group_values_msg);
