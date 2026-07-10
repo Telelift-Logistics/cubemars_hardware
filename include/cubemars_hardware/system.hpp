@@ -251,7 +251,6 @@ private:
     /// (true) or wait for a service request (false).
     bool auto_recalibrate_on_power_restore{true};
   } global_cfg_;
-  uint16_t retry_cnt_{0};
 
   // ---- lift power state tracking ----
   std::atomic<LiftPowerState> lift_power_state_{LiftPowerState::ONLINE};

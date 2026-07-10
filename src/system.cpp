@@ -279,7 +279,10 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
 
     // mount_dir: param value 1 means "up is -ve in raw encoder frame"
     mount_dir_.emplace_back(get_joint_param_int(joint, "mount_dir", 0) != 1);
-    zero_at_midpoint_.emplace_back(get_joint_param_int(joint, "zero_at_midpoint", 0) == 1);
+    // Default true: center the raw encoder at the midpoint (best int16
+    // headroom, and the behavior this driver has always used). Set to 0 for the
+    // simpler bottom-only strategy when the joint's range fits int16 from 0.
+    zero_at_midpoint_.emplace_back(get_joint_param_int(joint, "zero_at_midpoint", 1) == 1);
 
     // ---- Calibration config (per joint) ----
     CalibrationConfig & cfg = calibration_cfg_.back();
@@ -763,8 +766,21 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         issue_zero_command(i);
         return std::numeric_limits<double>::quiet_NaN();
       }
-      // Settle elapsed — encoder should now read ~0 at the bottom.
-      // Stage the midpoint setpoint and transition.
+      // Settle elapsed — encoder now reads ~0 at the bottom.
+      if (!zero_at_midpoint_[i]) {
+        // Bottom-only strategy: the hard stop is the operational zero. enc_offs_
+        // stays 0 (reported == raw), and the lift is already here, so there is
+        // no second move — calibration is complete. Trades int16 headroom (raw
+        // spans [0, range] instead of +/- half_range) for a shorter, safer run.
+        enc_offs_[i] = 0.0;
+        motor_msgs_[i].is_calibrated = true;
+        motor_msgs_[i].calibrate = false;
+        set_phase(i, CalibrationPhase::DONE);
+        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu: calibration DONE (bottom zero, enc_off=0.0)", i);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      // Midpoint strategy: stage the midpoint setpoint and keep centering.
       rt.commanded_setpoint = dir_up * half_range;
       set_phase(i, CalibrationPhase::FIND_MIDSECTION);
       return std::numeric_limits<double>::quiet_NaN();
@@ -775,8 +791,14 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         issue_zero_command(i);
         return std::numeric_limits<double>::quiet_NaN();
       }
-      // After settle, the encoder reads ~0 at the bottom.
-      // Next phase commands the midpoint in the (new) raw frame.
+      // After settle, the re-origined encoder reads ~0 at the current position.
+      // Re-seed the setpoint from that fresh reading before resuming the search;
+      // otherwise FIND_ROOT would resume from the stale (out-of-range) setpoint
+      // and trip the range check again immediately, burning every retry without
+      // moving. enc_offs_ is 0 during calibration, so raw == reported * dir_up.
+      rt.commanded_setpoint = std::isnan(hw_states_positions_[i])
+        ? 0.0
+        : hw_states_positions_[i] * dir_up;
       set_phase(i, CalibrationPhase::FIND_ROOT);
       return std::numeric_limits<double>::quiet_NaN();
     }
@@ -1139,12 +1161,13 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
             RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                          "Joint %zu: calibration position command out of range: %d",
                          i, position);
-            if(retry_cnt_ >= global_cfg_.max_retries) 
+            if (calibration_rt_[i].retry_count >= global_cfg_.max_retries) {
               set_phase(i, CalibrationPhase::FAILED);
-            else {
-              retry_cnt_ += 1;
+            } else {
+              calibration_rt_[i].retry_count += 1;
               RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
-                         "Retry %u of %u", retry_cnt_, global_cfg_.max_retries);
+                         "Joint %zu: calibration retry %u of %u", i,
+                         calibration_rt_[i].retry_count, global_cfg_.max_retries);
               set_phase(i, CalibrationPhase::SET_RETRY_ZERO);
             }
             continue;

@@ -178,6 +178,7 @@ namespace cubemars_hardware
         bool limit_sensor_seen{false};  // latched once per phase
         double commanded_setpoint{0.0}; // raw-frame setpoint being driven to
         std::chrono::steady_clock::time_point mode_wait_started{}; // epoch = not waiting for position mode
+        std::uint16_t retry_count{0};   // out-of-range retries used this run
     };
 }
 
