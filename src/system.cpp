@@ -604,16 +604,28 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_deactivate(
 
 void CubeMarsSystemHardware::enter_calibration(std::size_t i)
 {
+  // Recover the current raw encoder position BEFORE wiping enc_offs_, so the
+  // first FIND_ROOT step is a small delta from where the lift actually is, not
+  // a jump. The calibration state machine drives raw-frame setpoints, but
+  // hw_states_positions_ is in the reported frame:
+  //   reported = (raw - enc_offs_) * dir_up   (see read())
+  // Inverting (dir_up = +/-1, so 1/dir_up = dir_up):
+  //   raw = reported * dir_up + enc_offs_
+  // enc_offs_ must still hold the OLD value here; reading it after the wipe
+  // would drop the offset a prior calibration left behind and seed the lift
+  // half_range away from its true position. If the read hasn't populated yet,
+  // fall back to 0.
+  const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
+  const double cur_raw = std::isnan(hw_states_positions_[i])
+    ? 0.0
+    : hw_states_positions_[i] * dir_up + enc_offs_[i];
+
   // Wipe any prior offset so the raw encoder frame == calibration frame.
   // This is critical: phases 1-3 rely on raw readings.
   enc_offs_[i] = 0.0;
 
   calibration_rt_[i] = CalibrationRuntime{};
-  // Seed the setpoint from the current encoder position so the first FIND_ROOT
-  // step is a small delta from where the lift actually is, not a jump from 0.
-  // If the read hasn't populated yet, fall back to 0.
-  calibration_rt_[i].commanded_setpoint =
-    std::isnan(hw_states_positions_[i]) ? 0.0 : hw_states_positions_[i];
+  calibration_rt_[i].commanded_setpoint = cur_raw;
   motor_msgs_[i].is_calibrated = false;
   motor_msgs_[i].calibrate = true;
 
