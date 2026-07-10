@@ -250,6 +250,10 @@ private:
     /// @brief On transition RECOVERING → calibrating, run calibration automatically
     /// (true) or wait for a service request (false).
     bool auto_recalibrate_on_power_restore{true};
+
+    /// Consecutive active lower-limit-sensor readings required before the limit
+    /// is asserted (debounce). Deactivation is immediate. 1 disables debounce.
+    int limit_debounce_frames{2};
   } global_cfg_;
 
   // ---- lift power state tracking ----
@@ -257,6 +261,15 @@ private:
   std::atomic<bool> gpio_power_seen_high_{true};  // latched from GPIO callback
   std::vector<std::chrono::steady_clock::time_point> last_telemetry_;
   std::vector<int> good_frames_since_offline_;
+
+  // ---- lower-limit sensor state ----
+  /// @brief Debounced lower-limit state, one bit per joint (bit i set => joint
+  /// i is at its lower limit). Written by process_gpio_message (node thread),
+  /// read by read()/write() (RT thread); atomic for that cross-thread access.
+  std::atomic<std::uint64_t> limit_active_mask_{0};
+  /// @brief Per-joint consecutive active-reading count for debounce. Only
+  /// touched inside process_gpio_message (node thread).
+  std::vector<int> limit_active_count_;
 
   /// @brief Evaluate GPIO + telemetry timestamps and update lift_power_state_.
   /// Called from read() each cycle.

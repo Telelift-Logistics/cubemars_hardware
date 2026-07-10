@@ -168,6 +168,8 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       get_hw_param_int(info_, "min_telemetry_frames_to_resume", 3);
     global_cfg_.auto_recalibrate_on_power_restore =
       (get_hw_param_int(info_, "auto_recalibrate_on_power_restore", 1) == 1);
+    global_cfg_.limit_debounce_frames =
+      std::max(1, get_hw_param_int(info_, "limit_debounce_frames", 2));
   }
 
   // -------------------- resize per-joint vectors --------------------
@@ -185,6 +187,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   calibration_rt_.assign(n, CalibrationRuntime{});
   last_telemetry_.assign(n, std::chrono::steady_clock::time_point{});
   good_frames_since_offline_.assign(n, 0);
+  limit_active_count_.assign(n, 0);
 
   // -------------------- per-joint parameters --------------------
   for (const hardware_interface::ComponentInfo & joint : info_.joints) {
@@ -355,6 +358,16 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
           joint.name.c_str());
       }
     }
+
+    // ---- Lower-limit sensor availability (informational) ----
+    const bool limit_sensor_active =
+      global_cfg_.use_limit_sensor && !cfg.gpio_ifc_name.empty();
+    RCLCPP_INFO(
+      rclcpp::get_logger("CubeMarsSystemHardware"),
+      "Joint %s: lower-limit sensor %s", joint.name.c_str(),
+      limit_sensor_active
+        ? "ENABLED (protective downward stop active)"
+        : "not configured (behavior unchanged)");
 
     // ---- Build outbound MotorCommand record ----
     MotorCommandMsg msg;
@@ -979,6 +992,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
         enter_safe_state(true);
       }
 
+      motor_msgs_[i].at_lower_limit =
+        (i < 64) && (((limit_active_mask_.load() >> i) & 1ULL) != 0ULL);
       motor_msg_grp_.commands.push_back(motor_msgs_[i]);
     }
   }
@@ -1209,15 +1224,25 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     }
 
     // ---- Normal operation ----
-    switch (control_mode_[i]) 
+    // Lower-limit protective stop: while the (debounced) limit sensor is active,
+    // inhibit commands that would drive the joint further toward the limit
+    // (downward), evaluated in the controller/reported command frame — a
+    // decreasing position, negative velocity, or negative effort. Motion away
+    // from the limit passes unchanged. Non-latching: clears with the sensor.
+    const bool at_lower_limit =
+      (i < 64) && (((limit_active_mask_.load() >> i) & 1ULL) != 0ULL);
+
+    switch (control_mode_[i])
     {
       case UNDEFINED:
         break;
 
       case CURRENT_LOOP: {
         if (std::isnan(hw_commands_efforts_[i])) break;
+        double eff_cmd = hw_commands_efforts_[i];
+        if (at_lower_limit && eff_cmd < 0.0) eff_cmd = 0.0;  // block downward effort
         std::int32_t current =
-          static_cast<std::int32_t>(hw_commands_efforts_[i] * 1000.0 / torque_constants_[i]);
+          static_cast<std::int32_t>(eff_cmd * 1000.0 / torque_constants_[i]);
         if (std::abs(current) >= 60000) {
           RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                        "current command out of range: %d", current);
@@ -1235,6 +1260,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
       case SPEED_LOOP: {
         if (std::isnan(hw_commands_velocities_[i])) break;
         double vel_cmd = hw_commands_velocities_[i];
+        if (at_lower_limit && vel_cmd < 0.0) vel_cmd = 0.0;  // block downward velocity
         if (use_meters_) vel_cmd /= m_per_rad_[i];  // m/s → rad/s at output shaft
         std::int32_t speed = static_cast<std::int32_t>(vel_cmd * erpm_conversions_[i]);
         if (std::abs(speed) >= 100000) {
@@ -1253,10 +1279,16 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case POSITION_LOOP: {
         if (std::isnan(hw_commands_positions_[i])) break;
+        double pos_cmd = hw_commands_positions_[i];
+        // At the lower limit, do not command below the current position.
+        if (at_lower_limit && !std::isnan(hw_states_positions_[i]) &&
+            pos_cmd < hw_states_positions_[i]) {
+          pos_cmd = hw_states_positions_[i];
+        }
         // Add the offset in output units, convert to output radians via the
         // lead-screw factor (if meters), then scale to wire centidegree-LSB.
         const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
-        double cmd_with_off = (dir_up * hw_commands_positions_[i]) + enc_offs_[i];
+        double cmd_with_off = (dir_up * pos_cmd) + enc_offs_[i];
         if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
         const std::int32_t position =
           static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
@@ -1283,6 +1315,11 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         if (motor_msgs_[i].is_calibrated && hardware_limits_[i].range > 0.0) {
           if (cmd < 0.0) cmd = 0.0;
           if (cmd > hardware_limits_[i].range) cmd = hardware_limits_[i].range;
+        }
+        // At the lower limit, do not command below the current position.
+        if (at_lower_limit && !std::isnan(hw_states_positions_[i]) &&
+            cmd < hw_states_positions_[i]) {
+          cmd = hw_states_positions_[i];
         }
         cmd = cmd * dir_up;
         // Add the offset in output units, convert to output radians via the
@@ -1468,18 +1505,35 @@ void CubeMarsSystemHardware::process_gpio_message(const ControlMessage & msg)
     const std::string & grp_name = msg.interface_groups[g];
     const auto & ifc_values = msg.interface_values[g];
     
-    // Limit Sensor Handling
+    // Limit Sensor Handling (debounced activation, immediate deactivation)
     for (std::size_t i = 0; i < info_.joints.size(); ++i) {
       const auto & cfg = calibration_cfg_[i];
       if (cfg.gpio_group_name.empty() || cfg.gpio_ifc_name.empty()) continue;
       if (cfg.gpio_group_name != grp_name) continue;
 
       for (std::size_t t = 0; t < ifc_values.interface_names.size(); ++t) {
-        if (ifc_values.interface_names[t] == cfg.gpio_ifc_name) {
-          // Floating-point safe comparison: > 0.5 means "pressed/high".
-          if (ifc_values.values[t] > 0.5) {
-            calibration_rt_[i].limit_sensor_seen = true; // @todo Ephson - use this variable in read to stop the lift
+        if (ifc_values.interface_names[t] != cfg.gpio_ifc_name) continue;
+
+        // > 0.5 means "pressed/high". Assert the limit only after
+        // limit_debounce_frames consecutive active readings (filters bounce);
+        // clear immediately on the first inactive reading so motion away from
+        // the limit is never held back.
+        const std::uint64_t bit = (i < 64) ? (1ULL << i) : 0ULL;
+        if (ifc_values.values[t] > 0.5) {
+          if (limit_active_count_[i] < global_cfg_.limit_debounce_frames) {
+            ++limit_active_count_[i];
           }
+          if (limit_active_count_[i] >= global_cfg_.limit_debounce_frames) {
+            limit_active_mask_.fetch_or(bit);
+            // Debounced trigger also feeds calibration bottom detection
+            // (per-phase latch, reset in set_phase()).
+            if (is_calibration_running_.load() && motor_msgs_[i].calibrate) {
+              calibration_rt_[i].limit_sensor_seen = true;
+            }
+          }
+        } else {
+          limit_active_count_[i] = 0;
+          limit_active_mask_.fetch_and(~bit);
         }
       }
     }
