@@ -165,6 +165,16 @@ private:
   /// the runtime state so subsequent reads honor the settle window.
   void issue_zero_command(std::size_t joint_idx);
 
+  /// @brief Return the joint index that owns the given CAN id, or
+  /// info_.joints.size() if no joint matches. can_id (immutable after on_init)
+  /// is the mapping key for service requests, decoupling them from list order.
+  std::size_t joint_index_for_can_id(std::uint8_t can_id) const;
+
+  /// @brief Terminal calibration cleanup: stop motion, mark the joint
+  /// uncalibrated, and disable it. The caller must set the phase to FAILED
+  /// first (this only performs the side effects).
+  void abort_calibration_failed(std::size_t joint_idx);
+
   rclcpp::Node::SharedPtr node_;
   realtime_tools::RealtimeThreadSafeBox<std::vector<MotorCommandMsg>> command_mailbox_;
   rclcpp::Service<MotorControlService>::SharedPtr motor_srvr_;

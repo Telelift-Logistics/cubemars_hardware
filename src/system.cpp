@@ -657,6 +657,22 @@ void CubeMarsSystemHardware::issue_zero_command(std::size_t i)
   calibration_rt_[i].zero_cmd_pending = true;
 }
 
+std::size_t CubeMarsSystemHardware::joint_index_for_can_id(std::uint8_t can_id) const
+{
+  for (std::size_t i = 0; i < motor_msgs_.size(); ++i) {
+    if (motor_msgs_[i].can_id == can_id) return i;
+  }
+  return info_.joints.size();  // not found
+}
+
+void CubeMarsSystemHardware::abort_calibration_failed(std::size_t i)
+{
+  can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+  motor_msgs_[i].calibrate = false;
+  motor_msgs_[i].is_calibrated = false;
+  motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+}
+
 double CubeMarsSystemHardware::step_calibration(std::size_t i)
 {
   // Returns the raw-frame setpoint to send this cycle, or NaN to skip writing.
@@ -870,6 +886,22 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     const std::size_t i = std::distance(can_ids_.begin(), it);
     all_ids[i] = true;
 
+    // A firmware fault (byte 7 != 0: over-current, stall, etc.) during
+    // calibration means the motor has likely cut out. Its effort reading then
+    // collapses to ~0, so FIND_ROOT's stall-torque detection can never fire and
+    // the phase would grind out its full timeout while jammed. Fail fast by
+    // driving the joint to FAILED; write()'s FAILED handler stops motion,
+    // disables, and clears the calibration latch.
+    if (read_data[7] != 0 && is_calibration_running_.load() &&
+        motor_msgs_[i].calibrate &&
+        calibration_rt_[i].phase != CalibrationPhase::FAILED)
+    {
+      RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                   "Joint %zu: motor fault (code %u) during calibration; aborting",
+                   i, read_data[7]);
+      set_phase(i, CalibrationPhase::FAILED);
+    }
+
     last_telemetry_[i] = std::chrono::steady_clock::now();
     if (offline) {
       good_frames_since_offline_[i]++;
@@ -978,20 +1010,35 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     bool any_calibration = false;
     bool any_state_change = false;
 
-    for (std::size_t i = 0; i < info_.joints.size(); i++) {
-      if (i >= latest_cmd.size()) break;
-      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Size OK");
-      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
-                  "Internal motor id: %i Commanded Id: %i", motor_msgs_[i].can_id, latest_cmd[i].can_id);
-      if (motor_msgs_[i].can_id != latest_cmd[i].can_id) continue;
+    // Map each command to its joint by CAN id (not list position), so a request
+    // may target a subset of joints in any order.
+    for (const auto & cmd : latest_cmd) {
+      const std::size_t i = joint_index_for_can_id(cmd.can_id);
+      if (i >= info_.joints.size()) {
+        // Unknown CAN id. The service callback rejects these up front, so this
+        // is only a defensive guard against a malformed mailbox entry.
+        RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Dropping command for unknown CAN id %u", cmd.can_id);
+        continue;
+      }
 
-      if (latest_cmd[i].calibrate && calibration_cfg_[i].enabled) {
-        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Entering Calibration mode");
-        enter_calibration(i);
-        any_calibration = true;
+      if (cmd.calibrate && calibration_cfg_[i].enabled) {
+        // Never auto-move a disabled/faulted joint. If it isn't ENABLE, skip
+        // WITHOUT latching is_calibration_running_ (the per-joint loop below
+        // skips disabled joints, so a latched calibration would never progress
+        // and would wedge the service). Backstops the same check in the service
+        // callback against a race on get_motor_state.
+        if (motor_msgs_[i].get_motor_state != MotorCommandMsg::ENABLE) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "Joint %zu: cannot calibrate while disabled; send "
+                       "set_motor_state=ENABLE first", i);
+        } else {
+          enter_calibration(i);
+          any_calibration = true;
+        }
       } else {
-        motor_msgs_[i].set_motor_state = latest_cmd[i].set_motor_state;
-        if (latest_cmd[i].set_motor_state > 0) any_state_change = true;
+        motor_msgs_[i].set_motor_state = cmd.set_motor_state;
+        if (cmd.set_motor_state > 0) any_state_change = true;
       }
     }
 
@@ -1008,6 +1055,9 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
           motor_msgs_[i].set_motor_state == MotorCommandMsg::ENABLE)
       {
         motor_msgs_[i].get_motor_state = MotorCommandMsg::ENABLE;
+        // Transition applied; clear the pending request so is_changing_state_
+        // can latch down (0 == no pending state change).
+        motor_msgs_[i].set_motor_state = 0;
       }
       continue;
     }
@@ -1020,16 +1070,35 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     //               "User req: %b Trigger: %b Jt Calib flag: %b", motor_msgs_[i].calibrate, is_calibration_running_.load(), joint_calibrating);
 
     if (joint_calibrating) {
+      // A phase already marked FAILED (e.g. by read()'s fault handler) aborts
+      // immediately, independent of control mode.
+      if (calibration_rt_[i].phase == CalibrationPhase::FAILED) {
+        abort_calibration_failed(i);
+        continue;
+      }
       // Calibration runs ONLY in POSITION_SPEED_LOOP. If the controller hasn't
       // claimed position interfaces, we cannot safely move the joint; mark it
       if (control_mode_[i] != POSITION_SPEED_LOOP &&
           control_mode_[i] != POSITION_LOOP)
       {
-        // Wait for the position controller to claim interfaces. Re-stamp
-        // phase_started so the FIND_ROOT timeout doesn't tick down while we
-        // wait. Throttle-warn so a controller that never comes up is visible
-        // in the logs.
-        calibration_rt_[i].phase_started = std::chrono::steady_clock::now();
+        // Wait for the position controller to claim interfaces, but BOUND the
+        // wait: a controller that never enters position mode must not hang
+        // calibration forever. Track when the wait began and FAIL after
+        // phase_timeout. While waiting, keep phase_started fresh so the
+        // FIND_ROOT timer starts clean once position mode is acquired.
+        const auto now = std::chrono::steady_clock::now();
+        if (calibration_rt_[i].mode_wait_started.time_since_epoch().count() == 0) {
+          calibration_rt_[i].mode_wait_started = now;
+        }
+        if (now - calibration_rt_[i].mode_wait_started >= calibration_cfg_[i].phase_timeout) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "Joint %zu: timed out waiting for position control mode "
+                       "(current=%d); aborting calibration", i, control_mode_[i]);
+          set_phase(i, CalibrationPhase::FAILED);
+          abort_calibration_failed(i);
+          continue;
+        }
+        calibration_rt_[i].phase_started = now;
         RCLCPP_WARN_THROTTLE(
           rclcpp::get_logger("CubeMarsSystemHardware"),
           *node_->get_clock(), 2000,
@@ -1038,14 +1107,13 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         continue;
       }
       else {
+        // Position mode acquired; clear the mode-wait clock.
+        calibration_rt_[i].mode_wait_started = {};
         const double cal_cmd = step_calibration(i);
 
-        // FAILED terminates this joint: stop motion, mark uncalibrated, move on.
+        // FAILED terminates this joint: stop motion, mark uncalibrated, disable.
         if (calibration_rt_[i].phase == CalibrationPhase::FAILED) {
-          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-          motor_msgs_[i].calibrate = false;
-          motor_msgs_[i].is_calibrated = false;
-          motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+          abort_calibration_failed(i);
           continue;
         }
 
@@ -1100,6 +1168,11 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     {
       can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
       motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+      // Transition applied; clear the pending request. Without this, the
+      // latch-down check (which looks for set_motor_state == DISABLE) would
+      // find it set forever and is_changing_state_ would never clear, wedging
+      // the service on "Motor state change in progress".
+      motor_msgs_[i].set_motor_state = 0;
       continue;
     }
 
@@ -1287,23 +1360,59 @@ void CubeMarsSystemHardware::motor_control_callback(
     return;
   }
 
+  if (request->commands.empty()) {
+    response->success = false;
+    response->message = "Empty request: no commands";
+    return;
+  }
   if (request->commands.size() > info_.joints.size()) {
     response->success = false;
-    response->message = "Invalid Request: too many commands";
+    response->message = "Invalid request: more commands than joints";
     return;
   }
 
+  // Validate every command up front and reject with a specific message so the
+  // caller learns exactly why a request can't be fulfilled. Commands are keyed
+  // by CAN id, not list position.
   bool trigger_calibration = false;
   bool has_state_change_req = false;
-  for (std::size_t i = 0; i < request->commands.size(); i++) {
-    if (request->commands[i].calibrate) {
-      if (!calibration_cfg_[i].enabled) {
+  for (const auto & cmd : request->commands) {
+    const std::size_t j = joint_index_for_can_id(cmd.can_id);
+    if (j >= info_.joints.size()) {
+      response->success = false;
+      response->message =
+        "No joint configured for CAN id " + std::to_string(cmd.can_id);
+      return;
+    }
+
+    if (cmd.calibrate) {
+      if (!calibration_cfg_[j].enabled) {
         response->success = false;
-        response->message = "Joint not eligible for calibration";
+        response->message =
+          "Joint (CAN " + std::to_string(cmd.can_id) +
+          ") is not eligible for calibration";
+        return;
+      }
+      // Advisory: reject calibrating a disabled joint with a clear message.
+      // get_motor_state is owned by the RT write() thread; a stale read here is
+      // harmless because write() re-checks race-free before calibrating.
+      if (motor_msgs_[j].get_motor_state != MotorCommandMsg::ENABLE) {
+        response->success = false;
+        response->message =
+          "Joint (CAN " + std::to_string(cmd.can_id) +
+          ") is disabled; send set_motor_state=ENABLE before calibrating";
         return;
       }
       trigger_calibration = true;
-    } else if (request->commands[i].set_motor_state > 0) {
+    } else if (cmd.set_motor_state > 0) {
+      if (cmd.set_motor_state != MotorCommandMsg::ENABLE &&
+          cmd.set_motor_state != MotorCommandMsg::DISABLE) {
+        response->success = false;
+        response->message =
+          "Invalid set_motor_state for CAN " + std::to_string(cmd.can_id) +
+          " (use ENABLE=10 or DISABLE=11)";
+        return;
+      }
       has_state_change_req = true;
     }
 
@@ -1316,7 +1425,7 @@ void CubeMarsSystemHardware::motor_control_callback(
 
   if (!has_state_change_req && !trigger_calibration) {
     response->success = false;
-    response->message = "Unknown Request";
+    response->message = "Unknown request: no calibrate or state-change set";
     return;
   }
 
