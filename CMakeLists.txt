@@ -55,6 +55,15 @@ install(TARGETS cubemars_hardware
   RUNTIME DESTINATION bin
 )
 
+## TESTS
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_limit_sensor test/test_limit_sensor.cpp)
+  target_include_directories(test_limit_sensor PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_features(test_limit_sensor PUBLIC cxx_std_17)
+endif()
+
 ## EXPORTS
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(${THIS_PACKAGE_INCLUDE_DEPENDS})

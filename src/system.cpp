@@ -1239,8 +1239,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case CURRENT_LOOP: {
         if (std::isnan(hw_commands_efforts_[i])) break;
-        double eff_cmd = hw_commands_efforts_[i];
-        if (at_lower_limit && eff_cmd < 0.0) eff_cmd = 0.0;  // block downward effort
+        double eff_cmd = clamp_downward_at_lower_limit(hw_commands_efforts_[i], at_lower_limit);
         std::int32_t current =
           static_cast<std::int32_t>(eff_cmd * 1000.0 / torque_constants_[i]);
         if (std::abs(current) >= 60000) {
@@ -1259,8 +1258,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case SPEED_LOOP: {
         if (std::isnan(hw_commands_velocities_[i])) break;
-        double vel_cmd = hw_commands_velocities_[i];
-        if (at_lower_limit && vel_cmd < 0.0) vel_cmd = 0.0;  // block downward velocity
+        double vel_cmd = clamp_downward_at_lower_limit(hw_commands_velocities_[i], at_lower_limit);
         if (use_meters_) vel_cmd /= m_per_rad_[i];  // m/s → rad/s at output shaft
         std::int32_t speed = static_cast<std::int32_t>(vel_cmd * erpm_conversions_[i]);
         if (std::abs(speed) >= 100000) {
@@ -1279,12 +1277,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
 
       case POSITION_LOOP: {
         if (std::isnan(hw_commands_positions_[i])) break;
-        double pos_cmd = hw_commands_positions_[i];
-        // At the lower limit, do not command below the current position.
-        if (at_lower_limit && !std::isnan(hw_states_positions_[i]) &&
-            pos_cmd < hw_states_positions_[i]) {
-          pos_cmd = hw_states_positions_[i];
-        }
+        double pos_cmd = clamp_position_at_lower_limit(
+          hw_commands_positions_[i], hw_states_positions_[i], at_lower_limit);
         // Add the offset in output units, convert to output radians via the
         // lead-screw factor (if meters), then scale to wire centidegree-LSB.
         const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
@@ -1317,10 +1311,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
           if (cmd > hardware_limits_[i].range) cmd = hardware_limits_[i].range;
         }
         // At the lower limit, do not command below the current position.
-        if (at_lower_limit && !std::isnan(hw_states_positions_[i]) &&
-            cmd < hw_states_positions_[i]) {
-          cmd = hw_states_positions_[i];
-        }
+        cmd = clamp_position_at_lower_limit(cmd, hw_states_positions_[i], at_lower_limit);
         cmd = cmd * dir_up;
         // Add the offset in output units, convert to output radians via the
         // lead-screw factor (if meters), then scale to wire centidegree-LSB.
@@ -1519,20 +1510,17 @@ void CubeMarsSystemHardware::process_gpio_message(const ControlMessage & msg)
         // clear immediately on the first inactive reading so motion away from
         // the limit is never held back.
         const std::uint64_t bit = (i < 64) ? (1ULL << i) : 0ULL;
-        if (ifc_values.values[t] > 0.5) {
-          if (limit_active_count_[i] < global_cfg_.limit_debounce_frames) {
-            ++limit_active_count_[i];
-          }
-          if (limit_active_count_[i] >= global_cfg_.limit_debounce_frames) {
-            limit_active_mask_.fetch_or(bit);
-            // Debounced trigger also feeds calibration bottom detection
-            // (per-phase latch, reset in set_phase()).
-            if (is_calibration_running_.load() && motor_msgs_[i].calibrate) {
-              calibration_rt_[i].limit_sensor_seen = true;
-            }
+        const bool asserted = limit_debounce_update(
+          limit_active_count_[i], global_cfg_.limit_debounce_frames,
+          ifc_values.values[t] > 0.5);
+        if (asserted) {
+          limit_active_mask_.fetch_or(bit);
+          // Debounced trigger also feeds calibration bottom detection
+          // (per-phase latch, reset in set_phase()).
+          if (is_calibration_running_.load() && motor_msgs_[i].calibrate) {
+            calibration_rt_[i].limit_sensor_seen = true;
           }
         } else {
-          limit_active_count_[i] = 0;
           limit_active_mask_.fetch_and(~bit);
         }
       }

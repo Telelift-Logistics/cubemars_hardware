@@ -3,6 +3,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -180,6 +181,40 @@ namespace cubemars_hardware
         std::chrono::steady_clock::time_point mode_wait_started{}; // epoch = not waiting for position mode
         std::uint16_t retry_count{0};   // out-of-range retries used this run
     };
+
+    // ---------------------------------------------------------------------------
+    // Lower-limit sensor decision helpers (pure, unit-testable)
+    // ---------------------------------------------------------------------------
+
+    /// @brief Debounced activation of a lower-limit sensor. Updates @p count in
+    /// place and returns whether the limit is asserted. Activation requires
+    /// @p frames consecutive active readings; a single inactive reading clears
+    /// (immediate deactivation) and resets the count.
+    inline bool limit_debounce_update(int & count, int frames, bool active_reading)
+    {
+        if (active_reading) {
+            if (count < frames) ++count;
+            return count >= frames;
+        }
+        count = 0;
+        return false;
+    }
+
+    /// @brief While at the lower limit, forbid commanding a position below the
+    /// current position (downward). A NaN current position leaves @p cmd as-is.
+    inline double clamp_position_at_lower_limit(double cmd, double current_pos, bool at_limit)
+    {
+        if (at_limit && !std::isnan(current_pos) && cmd < current_pos) return current_pos;
+        return cmd;
+    }
+
+    /// @brief While at the lower limit, block a negative (downward) command
+    /// (velocity or effort); away-from-limit commands pass unchanged.
+    inline double clamp_downward_at_lower_limit(double cmd, bool at_limit)
+    {
+        if (at_limit && cmd < 0.0) return 0.0;
+        return cmd;
+    }
 }
 
 #endif  // CUBEMARS_HARDWARE__CAN_COMMANDS_HPP_
