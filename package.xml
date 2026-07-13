@@ -5,6 +5,7 @@
   <version>0.0.1</version>
   <description>CubeMars AK Series Hardware Interface for ros2_control</description>
   <maintainer email="j.haldemann@proton.me">Jan-Marco Haldemann</maintainer>
+  <maintainer email="ephson.guakro@telelift-logistic.com">Ephson Guakro</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
