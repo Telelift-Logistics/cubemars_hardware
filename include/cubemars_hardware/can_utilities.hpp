@@ -115,6 +115,19 @@ namespace cubemars_hardware
     }
 
     // ---------------------------------------------------------------------------
+    // Hardware-wide Function Block state
+    // ---------------------------------------------------------------------------
+    /// @brief Top-level FB states
+    enum struct FunctionBlockState : std::uint8_t
+    {
+        RUN = 1,    // sensor is engaged/ active
+        STOP = 2,   // FB is stopped
+        SAFE = 3,   // sensor is NOT engaged/ active
+        ERROR = 4,  // FB is in error
+        RESET = 5
+    };
+
+    // ---------------------------------------------------------------------------
     // Per-joint static calibration configuration (parsed from URDF on init)
     // ---------------------------------------------------------------------------
     /// @brief Static, joint-specific calibration tuning loaded from URDF.
@@ -154,14 +167,18 @@ namespace cubemars_hardware
         /// the flow entirely.
         bool enabled{true};
 
-        /// Name of the GPIO interface providing the lower-limit-sensor reading
+        /// Name of the GPIO interface group providing the limit-sensor readings
         /// for this joint inside the gpio_state_msg interface group. Empty
         /// means no per-joint sensor.
-        std::string gpio_ifc_name{};
-
-        /// Name of the GPIO interface group containing `gpio_sensor_name`.
+        std::string gpio_sensor_group_name{};
+        
+        /// Name of the GPIO interface name for upper-limit-sensor.
         /// Empty means no per-joint sensor.
-        std::string gpio_group_name{};
+        std::string gpio_top_sensor_ifc_name{};
+
+        /// Name of the GPIO interface name for lower-limit-sensor.
+        /// Empty means no per-joint sensor.
+        std::string gpio_bottom_sensor_ifc_name{};
     };
 
     // ---------------------------------------------------------------------------
@@ -214,6 +231,12 @@ namespace cubemars_hardware
     {
         if (at_limit && cmd < 0.0) return 0.0;
         return cmd;
+    }
+
+    /// @brief Return true if Function Block is in RUN state else FALSE
+    inline bool check_fb_enabled(std::uint8_t state)
+    {
+        return (state == static_cast<std::uint8_t>(FunctionBlockState::RUN));
     }
 }
 

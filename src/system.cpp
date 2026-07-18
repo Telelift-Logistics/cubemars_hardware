@@ -312,8 +312,9 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       get_joint_param_int(joint, "calibration_zero_settle_ms",
                           static_cast<int>(cfg.zero_settle.count())));
 
-    cfg.gpio_group_name  = get_joint_param_str(joint, "gpio_group_name", "");
-    cfg.gpio_ifc_name = get_joint_param_str(joint, "gpio_ifc_name", "");
+    cfg.gpio_sensor_group_name  = get_joint_param_str(joint, "gpio_sensor_group_name", "");
+    cfg.gpio_top_sensor_ifc_name = get_joint_param_str(joint, "gpio_top_sensor_ifc_name", "");
+    cfg.gpio_bottom_sensor_ifc_name = get_joint_param_str(joint, "gpio_bottom_sensor_ifc_name", "");
 
     // ---- Validation ----
     if (cfg.enabled) {
@@ -339,17 +340,21 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       // GPIO sensor requires both names if global_cfg_.use_limit_sensor is on AND the joint
       // declares one. Mixed config is OK (some joints use sensor, others fall
       // back to torque+timeout).
-      const bool gpio_partial =
-        (cfg.gpio_group_name.empty()) != (cfg.gpio_ifc_name.empty());
+      const int gpio_fields_set =
+          (!cfg.gpio_sensor_group_name.empty())
+          + (!cfg.gpio_top_sensor_ifc_name.empty())
+          + (!cfg.gpio_bottom_sensor_ifc_name.empty());
+      // partial = some but not all of the three fields are configured
+      const bool gpio_partial = (gpio_fields_set != 0) && (gpio_fields_set != 3);
       if (gpio_partial) {
         RCLCPP_ERROR(
           rclcpp::get_logger("CubeMarsSystemHardware"),
-          "Joint %s: gpio_group_name and gpio_ifc_name must be set together",
+          "Joint %s: gpio_sensor_group_name, gpio_top_sensor_ifc_name and gpio_bottom_sensor_ifc_name must be set together",
           joint.name.c_str());
         return hardware_interface::CallbackReturn::ERROR;
       }
       const bool will_use_sensor =
-        global_cfg_.use_limit_sensor && !cfg.gpio_ifc_name.empty();
+        global_cfg_.use_limit_sensor && !cfg.gpio_sensor_group_name.empty();
       if (!will_use_sensor && cfg.stall_torque <= 0.0) {
         RCLCPP_WARN(
           rclcpp::get_logger("CubeMarsSystemHardware"),
@@ -361,7 +366,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
 
     // ---- Lower-limit sensor availability (informational) ----
     const bool limit_sensor_active =
-      global_cfg_.use_limit_sensor && !cfg.gpio_ifc_name.empty();
+      global_cfg_.use_limit_sensor && !cfg.gpio_sensor_group_name.empty();
     RCLCPP_INFO(
       rclcpp::get_logger("CubeMarsSystemHardware"),
       "Joint %s: lower-limit sensor %s", joint.name.c_str(),
@@ -722,7 +727,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         (use_meters_ ? m_per_rad_[i] : 1.0);
 
       const bool gpio_active =
-        global_cfg_.use_limit_sensor && !cfg.gpio_ifc_name.empty();
+        global_cfg_.use_limit_sensor && !cfg.gpio_bottom_sensor_ifc_name.empty();
       bool bottom_found = false;
 
       if (gpio_active) {
@@ -978,21 +983,34 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
 
       // ---- Torque-limit handling (operational, NOT calibration) ----
       // Calibration's own stall threshold is checked inside step_calibration's
-      // FIND_ROOT branch; the operational trq_limit applies only when *not*
+      // FIND_ROOT branch; the operational trq_limit applies only when *NOT*
       // calibrating to avoid double-handling.
-      if (trq_limits_[i] != 0 &&
-          std::abs(hw_states_efforts_[i]) > trq_limits_[i] &&
-          !(is_calibration_running_ && motor_msgs_[i].calibrate))
+      if(!(is_calibration_running_ && motor_msgs_[i].calibrate))
       {
-        RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
-                    "Joint %zu went over torque limit (%f > %f), disabling.",
-                    i, hw_states_efforts_[i], trq_limits_[i]);
-        can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-        motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
-        enter_safe_state(true);
+        const auto & cfg = calibration_cfg_[i];
+        const bool gpio_active =
+        global_cfg_.use_limit_sensor && !cfg.gpio_bottom_sensor_ifc_name.empty();
+        if(gpio_active && gpio_bottom_sensor_seen_.load())
+        {
+          RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                      "Joint %zu lower limit sensor triggered - remove afterwards", i);
+          // can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+        }
+
+        // As a safety gate - cut off power and disable motor if torque limits are exceeded in operation
+        if (trq_limits_[i] != 0 &&
+          std::abs(hw_states_efforts_[i]) > trq_limits_[i])
+        {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                      "Joint %zu went over torque limit (%f > %f), disabling.",
+                      i, hw_states_efforts_[i], trq_limits_[i]);
+          can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+          motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+          enter_safe_state(true);
+        }
       }
 
-      motor_msgs_[i].at_lower_limit =
+      motor_msgs_[i].at_lower_limit = 
         (i < 64) && (((limit_active_mask_.load() >> i) & 1ULL) != 0ULL);
       motor_msg_grp_.commands.push_back(motor_msgs_[i]);
     }
@@ -1499,30 +1517,38 @@ void CubeMarsSystemHardware::process_gpio_message(const ControlMessage & msg)
     // Limit Sensor Handling (debounced activation, immediate deactivation)
     for (std::size_t i = 0; i < info_.joints.size(); ++i) {
       const auto & cfg = calibration_cfg_[i];
-      if (cfg.gpio_group_name.empty() || cfg.gpio_ifc_name.empty()) continue;
-      if (cfg.gpio_group_name != grp_name) continue;
+      if (cfg.gpio_sensor_group_name.empty() || cfg.gpio_top_sensor_ifc_name.empty() ||
+          cfg.gpio_bottom_sensor_ifc_name.empty()) 
+          continue;
+      if (cfg.gpio_sensor_group_name != grp_name) continue;
 
       for (std::size_t t = 0; t < ifc_values.interface_names.size(); ++t) {
-        if (ifc_values.interface_names[t] != cfg.gpio_ifc_name) continue;
-
-        // > 0.5 means "pressed/high". Assert the limit only after
-        // limit_debounce_frames consecutive active readings (filters bounce);
-        // clear immediately on the first inactive reading so motion away from
-        // the limit is never held back.
-        const std::uint64_t bit = (i < 64) ? (1ULL << i) : 0ULL;
-        const bool asserted = limit_debounce_update(
-          limit_active_count_[i], global_cfg_.limit_debounce_frames,
-          ifc_values.values[t] > 0.5);
-        if (asserted) {
-          limit_active_mask_.fetch_or(bit);
-          // Debounced trigger also feeds calibration bottom detection
-          // (per-phase latch, reset in set_phase()).
-          if (is_calibration_running_.load() && motor_msgs_[i].calibrate) {
-            calibration_rt_[i].limit_sensor_seen = true;
-          }
-        } else {
-          limit_active_mask_.fetch_and(~bit);
+        if (ifc_values.interface_names[t] == cfg.gpio_top_sensor_ifc_name) {
+          gpio_top_sensor_seen_.store(check_fb_enabled(static_cast<uint8_t>(ifc_values.values[t])));
         }
+        if (ifc_values.interface_names[t] == cfg.gpio_bottom_sensor_ifc_name) {
+          // Assert the limit only after
+          // limit_debounce_frames consecutive active readings (filters bounce);
+          // clear immediately on the first inactive reading so motion away from
+          // the limit is never held back.
+          const std::uint64_t bit = (i < 64) ? (1ULL << i) : 0ULL;
+          const bool asserted = limit_debounce_update(
+            limit_active_count_[i], global_cfg_.limit_debounce_frames,
+            check_fb_enabled(static_cast<uint8_t>(ifc_values.values[t])));
+          if (asserted) {
+            limit_active_mask_.fetch_or(bit);
+            // Debounced trigger also feeds calibration bottom detection
+            // (per-phase latch, reset in set_phase()).
+            if (is_calibration_running_.load() && motor_msgs_[i].calibrate) {
+              calibration_rt_[i].limit_sensor_seen = true;
+            }
+            gpio_bottom_sensor_seen_.store(check_fb_enabled(static_cast<uint8_t>(ifc_values.values[t])));
+          } else {
+            limit_active_mask_.fetch_and(~bit);
+            gpio_bottom_sensor_seen_.store(check_fb_enabled(static_cast<uint8_t>(ifc_values.values[t])));
+          }
+        }
+        continue;
       }
     }
 
@@ -1532,7 +1558,7 @@ void CubeMarsSystemHardware::process_gpio_message(const ControlMessage & msg)
     {
       for (std::size_t t = 0; t < ifc_values.interface_names.size(); ++t) {
         if (ifc_values.interface_names[t] == global_cfg_.gpio_power_ifc_name) {
-          gpio_power_seen_high_.store(ifc_values.values[t] > 0.5);
+          gpio_power_seen_high_.store(check_fb_enabled(static_cast<uint8_t>(ifc_values.values[t])));
         }
       }
     }

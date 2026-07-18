@@ -259,6 +259,8 @@ private:
   // ---- lift power state tracking ----
   std::atomic<LiftPowerState> lift_power_state_{LiftPowerState::ONLINE};
   std::atomic<bool> gpio_power_seen_high_{true};  // latched from GPIO callback
+  std::atomic<bool> gpio_top_sensor_seen_{false};  // latched from GPIO callback
+  std::atomic<bool> gpio_bottom_sensor_seen_{false};  // latched from GPIO callback
   std::vector<std::chrono::steady_clock::time_point> last_telemetry_;
   std::vector<int> good_frames_since_offline_;
 
