@@ -167,7 +167,7 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     global_cfg_.min_telemetry_frames_to_resume =
       get_hw_param_int(info_, "min_telemetry_frames_to_resume", 3);
     global_cfg_.auto_recalibrate_on_power_restore =
-      (get_hw_param_int(info_, "auto_recalibrate_on_power_restore", 1) == 1);
+      (get_hw_param_int(info_, "auto_recalibrate_on_power_restore", 0) == 1);
     global_cfg_.limit_debounce_frames =
       std::max(1, get_hw_param_int(info_, "limit_debounce_frames", 2));
   }
