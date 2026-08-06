@@ -182,6 +182,15 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
   hw_commands_velocities_.assign(n, std::numeric_limits<double>::quiet_NaN());
   hw_commands_accelerations_.assign(n, std::numeric_limits<double>::quiet_NaN());
   hw_commands_efforts_.assign(n, std::numeric_limits<double>::quiet_NaN());
+
+  reported_states_positions_.assign(n, 0.0);
+  reported_states_velocities_.assign(n, 0.0);
+  reported_states_efforts_.assign(n, 0.0);
+
+  last_calibrated_positions_.assign(n, 0.0);
+  last_calibrated_velocities_.assign(n, 0.0);
+  last_calibrated_efforts_.assign(n, 0.0);
+
   control_mode_.assign(n, control_mode_t::UNDEFINED);
   calibration_cfg_.assign(n, CalibrationConfig{});
   calibration_rt_.assign(n, CalibrationRuntime{});
@@ -488,11 +497,11 @@ CubeMarsSystemHardware::export_state_interfaces()
   std::vector<hardware_interface::StateInterface> state_interfaces;
   for (std::size_t i = 0; i < info_.joints.size(); i++) {
     state_interfaces.emplace_back(hardware_interface::StateInterface(
-      info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_positions_[i]));
+      info_.joints[i].name, hardware_interface::HW_IF_POSITION, &reported_states_positions_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
-      info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_states_velocities_[i]));
+      info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &reported_states_velocities_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
-      info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_states_efforts_[i]));
+      info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &reported_states_efforts_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints[i].name, "temperature", &hw_states_temperatures_[i]));
   }
@@ -1027,6 +1036,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
   }
 
   update_power_state();
+
+  update_reported_states();
 
   if(!motor_msg_grp_.commands.empty()) {
     motor_msg_grp_.header.stamp = node_->get_clock()->now();
@@ -1592,6 +1603,8 @@ void CubeMarsSystemHardware::enter_offline_state()
   // Unset STOP LIFT bit
   enter_safe_state(false);
 
+  update_reported_states();
+
   RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
               "Lift OFFLINE: clearing calibration, dropping pending commands");
 }
@@ -1716,6 +1729,31 @@ void CubeMarsSystemHardware::enter_safe_state(const bool &set)
     dynamic_interface_group_values_msg.interface_values.push_back(interface_value_msg);
     // Publish the command (RT).
     rt_pub_gpio_command_->try_publish(dynamic_interface_group_values_msg);
+  }
+}
+
+void CubeMarsSystemHardware::update_reported_states()
+{
+  for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+    if (motor_msgs_[i].is_calibrated) {
+      reported_states_positions_[i]  = hw_states_positions_[i];
+      reported_states_velocities_[i] = hw_states_velocities_[i];
+      reported_states_efforts_[i]    = hw_states_efforts_[i];
+
+      if (!std::isnan(hw_states_positions_[i])) {
+        last_calibrated_positions_[i] = hw_states_positions_[i];
+      }
+      if (!std::isnan(hw_states_velocities_[i])) {
+        last_calibrated_velocities_[i] = hw_states_velocities_[i];
+      }
+      if (!std::isnan(hw_states_efforts_[i])) {
+        last_calibrated_efforts_[i] = hw_states_efforts_[i];
+      }
+    } else {
+      reported_states_positions_[i]  = last_calibrated_positions_[i];
+      reported_states_velocities_[i] = last_calibrated_velocities_[i];
+      reported_states_efforts_[i]    = last_calibrated_efforts_[i];
+    }
   }
 }
 
