@@ -165,6 +165,16 @@ private:
   /// the runtime state so subsequent reads honor the settle window.
   void issue_zero_command(std::size_t joint_idx);
 
+  /// @brief Return the joint index that owns the given CAN id, or
+  /// info_.joints.size() if no joint matches. can_id (immutable after on_init)
+  /// is the mapping key for service requests, decoupling them from list order.
+  std::size_t joint_index_for_can_id(std::uint8_t can_id) const;
+
+  /// @brief Terminal calibration cleanup: stop motion, mark the joint
+  /// uncalibrated, and disable it. The caller must set the phase to FAILED
+  /// first (this only performs the side effects).
+  void abort_calibration_failed(std::size_t joint_idx);
+
   rclcpp::Node::SharedPtr node_;
   realtime_tools::RealtimeThreadSafeBox<std::vector<MotorCommandMsg>> command_mailbox_;
   rclcpp::Service<MotorControlService>::SharedPtr motor_srvr_;
@@ -240,14 +250,28 @@ private:
     /// @brief On transition RECOVERING → calibrating, run calibration automatically
     /// (true) or wait for a service request (false).
     bool auto_recalibrate_on_power_restore{true};
+
+    /// Consecutive active lower-limit-sensor readings required before the limit
+    /// is asserted (debounce). Deactivation is immediate. 1 disables debounce.
+    int limit_debounce_frames{2};
   } global_cfg_;
-  uint16_t retry_cnt_{0};
 
   // ---- lift power state tracking ----
   std::atomic<LiftPowerState> lift_power_state_{LiftPowerState::ONLINE};
   std::atomic<bool> gpio_power_seen_high_{true};  // latched from GPIO callback
+  std::atomic<bool> gpio_top_sensor_seen_{false};  // latched from GPIO callback
+  std::atomic<bool> gpio_bottom_sensor_seen_{false};  // latched from GPIO callback
   std::vector<std::chrono::steady_clock::time_point> last_telemetry_;
   std::vector<int> good_frames_since_offline_;
+
+  // ---- lower-limit sensor state ----
+  /// @brief Debounced lower-limit state, one bit per joint (bit i set => joint
+  /// i is at its lower limit). Written by process_gpio_message (node thread),
+  /// read by read()/write() (RT thread); atomic for that cross-thread access.
+  std::atomic<std::uint64_t> limit_active_mask_{0};
+  /// @brief Per-joint consecutive active-reading count for debounce. Only
+  /// touched inside process_gpio_message (node thread).
+  std::vector<int> limit_active_count_;
 
   /// @brief Evaluate GPIO + telemetry timestamps and update lift_power_state_.
   /// Called from read() each cycle.

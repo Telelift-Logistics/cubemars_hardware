@@ -3,6 +3,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -114,6 +115,19 @@ namespace cubemars_hardware
     }
 
     // ---------------------------------------------------------------------------
+    // Hardware-wide Function Block state
+    // ---------------------------------------------------------------------------
+    /// @brief Top-level FB states
+    enum struct FunctionBlockState : std::uint8_t
+    {
+        RUN = 1,    // sensor is engaged/ active
+        STOP = 2,   // FB is stopped
+        SAFE = 3,   // sensor is NOT engaged/ active
+        ERROR = 4,  // FB is in error
+        RESET = 5
+    };
+
+    // ---------------------------------------------------------------------------
     // Per-joint static calibration configuration (parsed from URDF on init)
     // ---------------------------------------------------------------------------
     /// @brief Static, joint-specific calibration tuning loaded from URDF.
@@ -153,14 +167,18 @@ namespace cubemars_hardware
         /// the flow entirely.
         bool enabled{true};
 
-        /// Name of the GPIO interface providing the lower-limit-sensor reading
+        /// Name of the GPIO interface group providing the limit-sensor readings
         /// for this joint inside the gpio_state_msg interface group. Empty
         /// means no per-joint sensor.
-        std::string gpio_ifc_name{};
-
-        /// Name of the GPIO interface group containing `gpio_sensor_name`.
+        std::string gpio_sensor_group_name{};
+        
+        /// Name of the GPIO interface name for upper-limit-sensor.
         /// Empty means no per-joint sensor.
-        std::string gpio_group_name{};
+        std::string gpio_top_sensor_ifc_name{};
+
+        /// Name of the GPIO interface name for lower-limit-sensor.
+        /// Empty means no per-joint sensor.
+        std::string gpio_bottom_sensor_ifc_name{};
     };
 
     // ---------------------------------------------------------------------------
@@ -177,7 +195,49 @@ namespace cubemars_hardware
         bool zero_cmd_pending{false};   // waiting for zero_settle to elapse
         bool limit_sensor_seen{false};  // latched once per phase
         double commanded_setpoint{0.0}; // raw-frame setpoint being driven to
+        std::chrono::steady_clock::time_point mode_wait_started{}; // epoch = not waiting for position mode
+        std::uint16_t retry_count{0};   // out-of-range retries used this run
     };
+
+    // ---------------------------------------------------------------------------
+    // Lower-limit sensor decision helpers (pure, unit-testable)
+    // ---------------------------------------------------------------------------
+
+    /// @brief Debounced activation of a lower-limit sensor. Updates @p count in
+    /// place and returns whether the limit is asserted. Activation requires
+    /// @p frames consecutive active readings; a single inactive reading clears
+    /// (immediate deactivation) and resets the count.
+    inline bool limit_debounce_update(int & count, int frames, bool active_reading)
+    {
+        if (active_reading) {
+            if (count < frames) ++count;
+            return count >= frames;
+        }
+        count = 0;
+        return false;
+    }
+
+    /// @brief While at the lower limit, forbid commanding a position below the
+    /// current position (downward). A NaN current position leaves @p cmd as-is.
+    inline double clamp_position_at_lower_limit(double cmd, double current_pos, bool at_limit)
+    {
+        if (at_limit && !std::isnan(current_pos) && cmd < current_pos) return current_pos;
+        return cmd;
+    }
+
+    /// @brief While at the lower limit, block a negative (downward) command
+    /// (velocity or effort); away-from-limit commands pass unchanged.
+    inline double clamp_downward_at_lower_limit(double cmd, bool at_limit)
+    {
+        if (at_limit && cmd < 0.0) return 0.0;
+        return cmd;
+    }
+
+    /// @brief Return true if Function Block is in RUN state else FALSE
+    inline bool check_fb_enabled(std::uint8_t state)
+    {
+        return (state == static_cast<std::uint8_t>(FunctionBlockState::RUN));
+    }
 }
 
 #endif  // CUBEMARS_HARDWARE__CAN_COMMANDS_HPP_
