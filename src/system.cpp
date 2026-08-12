@@ -992,9 +992,6 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       // calibrating to avoid double-handling.
       if(!(is_calibration_running_ && motor_msgs_[i].calibrate))
       {
-        const auto & cfg = calibration_cfg_[i];
-        const bool gpio_active =
-        global_cfg_.use_limit_sensor && !cfg.gpio_bottom_sensor_ifc_name.empty();
 
         // As a safety gate - cut off power and disable motor if torque limits are exceeded in operation
         if (trq_limits_[i] != 0 &&
