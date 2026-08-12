@@ -103,6 +103,16 @@ private:
   std::vector<double> hw_states_efforts_;
   std::vector<double> hw_states_temperatures_;
 
+  // ---- Reported states (exposed to state interfaces) ----
+  std::vector<double> reported_states_positions_;
+  std::vector<double> reported_states_velocities_;
+  std::vector<double> reported_states_efforts_;
+
+  // ---- Last known calibrated states ----
+  std::vector<double> last_calibrated_positions_;
+  std::vector<double> last_calibrated_velocities_;
+  std::vector<double> last_calibrated_efforts_;
+
   // ---- per-joint static motor parameters ----
   std::vector<double> erpm_conversions_;
   std::vector<double> torque_constants_;
@@ -288,6 +298,9 @@ private:
   /// @brief Publisher to trigger SAFE stop.
   /// Called from read() each cycle.
   void enter_safe_state(const bool &set = true);
+
+  /// @brief Update the reported position, velocity and effort states exposed to ROS 2 control.
+  void update_reported_states();
 
 };
 
