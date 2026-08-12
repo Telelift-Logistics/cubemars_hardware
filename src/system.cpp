@@ -972,8 +972,6 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       const double pos_rad = pos_raw * 0.1 * M_PI / 180.0;
       const double pos_output = use_meters_ ? (pos_rad * m_per_rad_[i]) : pos_rad;
       hw_states_positions_[i] = (pos_output - enc_offs_[i]) * dir_up;
-      // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
-      //               "Joint %zu: pos-output: %f enc_offs: %f pos-hdw: %f", i, pos_output, enc_offs_[i], hw_states_positions_[i]);
   
       // Velocity: vel_raw is in ERPM (electrical RPM) at the motor.
       //   ERPM / erpm_conversion = output rad/s. No extra factor of 10.
@@ -985,8 +983,6 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       // Effort: raw is centi-amps; multiply by Kt and gear ratio.
       const int gear_ratio = std::stoi(info_.joints[i].parameters.at("gear_ratio"));
       hw_states_efforts_[i] = curr_raw * 0.01 * torque_constants_[i] * gear_ratio;
-      // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 1000,
-      //               "Raw Current %f: Effort: %f", (curr_raw*0.01), hw_states_efforts_[i]);
   
       hw_states_temperatures_[i] = static_cast<double>(temp_raw);
 
@@ -996,15 +992,6 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
       // calibrating to avoid double-handling.
       if(!(is_calibration_running_ && motor_msgs_[i].calibrate))
       {
-        const auto & cfg = calibration_cfg_[i];
-        const bool gpio_active =
-        global_cfg_.use_limit_sensor && !cfg.gpio_bottom_sensor_ifc_name.empty();
-        if(gpio_active && gpio_bottom_sensor_seen_.load())
-        {
-          RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
-                      "Joint %zu lower limit sensor triggered - remove afterwards", i);
-          // can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
-        }
 
         // As a safety gate - cut off power and disable motor if torque limits are exceeded in operation
         if (trq_limits_[i] != 0 &&
@@ -1132,8 +1119,6 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     // controller is commanding.
     const bool joint_calibrating =
       is_calibration_running_.load() && motor_msgs_[i].calibrate;
-    // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"), *node_->get_clock(), 1000,
-    //               "User req: %b Trigger: %b Jt Calib flag: %b", motor_msgs_[i].calibrate, is_calibration_running_.load(), joint_calibrating);
 
     if (joint_calibrating) {
       // A phase already marked FAILED (e.g. by read()'s fault handler) aborts
@@ -1192,10 +1177,6 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
           double cmd_with_off = cal_cmd + enc_offs_[i];
           if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
 
-          // RCLCPP_INFO_THROTTLE(
-          //   rclcpp::get_logger("CubeMarsSystemHardware"),
-          //   *node_->get_clock(), 1000,
-          //   "Joint %zu: exec command - cal_cmd %f: cmd_w_off %f enc_off %f", i, cal_cmd, cmd_with_off, enc_offs_[i]);
           const std::int32_t position =
             static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
             
@@ -1347,11 +1328,6 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         double cmd_with_off = cmd + enc_offs_[i];
         if (use_meters_) cmd_with_off /= m_per_rad_[i];  // now in rad
 
-        // RCLCPP_INFO_THROTTLE(
-        // rclcpp::get_logger("CubeMarsSystemHardware"),
-        // *node_->get_clock(), 1000,
-        // "Joint %zu: exec command - cmd %f: cmd_w_off %f enc_off %f", i, cmd, cmd_with_off, enc_offs_[i]);
-
         const std::int32_t position =
           static_cast<std::int32_t>(cmd_with_off * 10000.0 * 180.0 / M_PI);
         if (std::abs(position) >= 360000000) {
@@ -1367,8 +1343,6 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         data[4] = vel >> 8;       data[5] = vel;
         data[6] = acc >> 8;       data[7] = acc;
         can_.write_message(can_ids_[i] | POSITION_SPEED_LOOP << 8, data, 8);
-        // RCLCPP_INFO_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),*node_->get_clock(), 3000,
-        //           "Raw Position %zu: Vel: %zu Acc: %zu", position, vel, acc);
         break;
       }
 
