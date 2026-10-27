@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -399,10 +400,13 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
     std::string node_name = this->get_name() + "_internal_node";
     node_ = std::make_shared<rclcpp::Node>(node_name);
     
+    srv_callback_group_ =
+      node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     motor_srvr_ = node_->create_service<MotorControlService>(
     "lift_platform_hardware",
     std::bind(&CubeMarsSystemHardware::motor_control_callback, this,
-              std::placeholders::_1, std::placeholders::_2));
+              std::placeholders::_1, std::placeholders::_2),
+    rclcpp::ServicesQoS(), srv_callback_group_);
 
     if (global_cfg_.use_limit_sensor) {
       sub_gpio_states_ = node_->create_subscription<ControlMessage>(
@@ -1486,8 +1490,38 @@ void CubeMarsSystemHardware::motor_control_callback(
   command_mailbox_.set(request->commands);
   has_request_.store(true);
 
-  response->success = true;
-  response->message = trigger_calibration ? "Starting calibration" : "Changing motor state";
+  if (!trigger_calibration) {
+    response->success = true;
+    response->message = "Changing motor state";
+    return;
+  }
+
+  // Block until write() has consumed the request and every calibrating joint
+  // reached DONE or FAILED. write() raises is_calibration_running_ before
+  // clearing has_request_, so both being false means the run is over. The
+  // per-phase timeouts and enter_offline_state() guarantee this terminates.
+  while (rclcpp::ok() &&
+         (has_request_.load() || is_calibration_running_.load()))
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  std::string failed;
+  for (const auto & cmd : request->commands) {
+    if (!cmd.calibrate) continue;
+    const std::size_t j = joint_index_for_can_id(cmd.can_id);
+    if (calibration_rt_[j].phase != CalibrationPhase::DONE ||
+        !motor_msgs_[j].is_calibrated)
+    {
+      failed += " CAN " + std::to_string(cmd.can_id) + " (" +
+                to_string(calibration_rt_[j].phase) + ")";
+    }
+  }
+
+  response->success = failed.empty();
+  response->message = failed.empty()
+    ? "Calibration complete"
+    : "Calibration failed for:" + failed;
 }
 
 // ============================================================================

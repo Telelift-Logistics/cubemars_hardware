@@ -187,6 +187,9 @@ private:
 
   rclcpp::Node::SharedPtr node_;
   realtime_tools::RealtimeThreadSafeBox<std::vector<MotorCommandMsg>> command_mailbox_;
+  /// @brief Dedicated group for motor_srvr_: a calibrate call blocks until
+  /// calibration completes, and must not starve sub_gpio_states_ meanwhile.
+  rclcpp::CallbackGroup::SharedPtr srv_callback_group_;
   rclcpp::Service<MotorControlService>::SharedPtr motor_srvr_;
   rclcpp::Subscription<ControlMessage>::SharedPtr sub_gpio_states_;
 
