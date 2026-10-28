@@ -63,6 +63,12 @@ namespace cubemars_hardware
     ///   RETURN_TO_HOME  -- drive back to the bottom (now operational zero).
     ///   DONE            -- mark joint calibrated; calibration finished.
     ///   FAILED          -- terminal failure state; joint remains uncalibrated.
+    ///
+    /// Lowering (lift_controller OPERATION_LOWER) reuses this state machine
+    /// without touching the calibration:
+    ///   LOWERING        -- drive to position 0 (calibrated), or step down
+    ///                      until the bottom is detected (uncalibrated).
+    ///   LOWERED         -- lowering finished at the bottom.
     enum struct CalibrationPhase : std::uint8_t
     {
         FIND_ROOT = 1,
@@ -73,6 +79,8 @@ namespace cubemars_hardware
         DONE = 6,
         FAILED = 7,
         SET_RETRY_ZERO = 8,
+        LOWERING = 9,
+        LOWERED = 10,
         DEFAULT = 0  // not running
     };
 
@@ -87,6 +95,8 @@ namespace cubemars_hardware
             case CalibrationPhase::SET_RETRY_ZERO: return "SET_RETRY_ZERO";
             case CalibrationPhase::DONE: return "DONE";
             case CalibrationPhase::FAILED: return "FAILED";
+            case CalibrationPhase::LOWERING: return "LOWERING";
+            case CalibrationPhase::LOWERED: return "LOWERED";
             case CalibrationPhase::DEFAULT: return "DEFAULT";
         }
         return "UNKNOWN";
@@ -200,6 +210,12 @@ namespace cubemars_hardware
         std::uint16_t retry_count{0};   // out-of-range retries used this run
         // Where this run finishes (reported frame); NaN until SET_MID_ZERO picks it.
         double target_position{std::numeric_limits<double>::quiet_NaN()};
+        // This run lowers the lift instead of calibrating it.
+        bool lowering{false};
+        // Lowering a calibrated lift: drive to reported 0 rather than search.
+        bool lower_to_zero{false};
+        // Search start (offset frame) of an uncalibrated lowering, to bound its travel.
+        double lower_start{0.0};
     };
 
     // ---------------------------------------------------------------------------
