@@ -13,6 +13,7 @@ using cubemars_hardware::CalibrationPhase;
 using cubemars_hardware::LiftJointView;
 using cubemars_hardware::LiftPowerState;
 using cubemars_hardware::check_lift_goal;
+using cubemars_hardware::lift_operation_name;
 using cubemars_hardware::to_phase_msg;
 using cubemars_hardware::to_power_state_msg;
 using Goal = univan_control_msgs::action::LiftControl::Goal;
@@ -103,6 +104,33 @@ TEST(LiftGoal, EnableAcceptsDisabledAndNonCalibratingJoints)
   EXPECT_EQ(check.targets, (std::vector<std::size_t>{2, 1}));  // goal order
 }
 
+TEST(LiftGoal, LowerFollowsTheCalibrationEligibilityRules)
+{
+  // LOWER moves the lift with the calibration settings, so it targets the same joints.
+  EXPECT_EQ(check_lift_goal(Goal::OPERATION_LOWER, {2}, kJoints).error_code,
+            Result::ERROR_NOT_ELIGIBLE);
+  EXPECT_EQ(check_lift_goal(Goal::OPERATION_LOWER, {3}, kJoints).error_code,
+            Result::ERROR_JOINT_DISABLED);
+
+  const auto listed = check_lift_goal(Goal::OPERATION_LOWER, {1}, kJoints);
+  EXPECT_EQ(listed.error_code, Result::ERROR_NONE);
+  EXPECT_EQ(listed.targets, (std::vector<std::size_t>{0}));
+
+  const std::vector<LiftJointView> enabled{{1, true, true}, {2, false, true}, {3, true, true}};
+  const auto all = check_lift_goal(Goal::OPERATION_LOWER, {}, enabled);
+  EXPECT_EQ(all.error_code, Result::ERROR_NONE);
+  EXPECT_EQ(all.targets, (std::vector<std::size_t>{0, 2}));
+}
+
+TEST(LiftGoal, OperationNames)
+{
+  EXPECT_STREQ(lift_operation_name(Goal::OPERATION_CALIBRATE), "CALIBRATE");
+  EXPECT_STREQ(lift_operation_name(Goal::OPERATION_ENABLE), "ENABLE");
+  EXPECT_STREQ(lift_operation_name(Goal::OPERATION_DISABLE), "DISABLE");
+  EXPECT_STREQ(lift_operation_name(Goal::OPERATION_LOWER), "LOWER");
+  EXPECT_STREQ(lift_operation_name(42), "UNKNOWN");
+}
+
 // --- State mapping
 
 TEST(LiftStateMapping, EveryCalibrationPhaseMapsToItsMessagePhase)
@@ -116,12 +144,14 @@ TEST(LiftStateMapping, EveryCalibrationPhaseMapsToItsMessagePhase)
   EXPECT_EQ(to_phase_msg(CalibrationPhase::DONE), JointMsg::PHASE_DONE);
   EXPECT_EQ(to_phase_msg(CalibrationPhase::FAILED), JointMsg::PHASE_FAILED);
   EXPECT_EQ(to_phase_msg(CalibrationPhase::SET_RETRY_ZERO), JointMsg::PHASE_SET_RETRY_ZERO);
+  EXPECT_EQ(to_phase_msg(CalibrationPhase::LOWERING), JointMsg::PHASE_LOWERING);
+  EXPECT_EQ(to_phase_msg(CalibrationPhase::LOWERED), JointMsg::PHASE_LOWERED);
 }
 
 TEST(LiftStateMapping, MessagePhasesShareTheInternalValues)
 {
   // The result's failure message casts a message phase back to name it.
-  for (std::uint8_t v = 0; v <= 8; ++v) {
+  for (std::uint8_t v = 0; v <= 10; ++v) {
     EXPECT_EQ(to_phase_msg(static_cast<CalibrationPhase>(v)), v);
   }
 }

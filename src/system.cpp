@@ -749,8 +749,40 @@ void CubeMarsSystemHardware::abort_calibration_failed(std::size_t i)
 {
   can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
   motor_msgs_[i].calibrate = false;
-  motor_msgs_[i].is_calibrated = false;
+  // A failed lowering leaves the calibration as it was.
+  if (!calibration_rt_[i].lowering) motor_msgs_[i].is_calibrated = false;
   motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
+}
+
+void CubeMarsSystemHardware::enter_lowering(std::size_t i)
+{
+  // Lowering moves relative to the current position and never re-zeroes the
+  // encoder, so enc_offs_ and is_calibrated are left alone.
+  calibration_rt_[i] = CalibrationRuntime{};
+  auto & rt = calibration_rt_[i];
+  rt.lowering = true;
+  rt.lower_to_zero = motor_msgs_[i].is_calibrated;
+  motor_msgs_[i].calibrate = true;
+  set_phase(i, CalibrationPhase::LOWERING);
+
+  if (rt.lower_to_zero) {
+    rt.target_position = 0.0;
+  } else if (std::isnan(hw_states_positions_[i])) {
+    // No position to search down from.
+    RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                 "Joint %zu: cannot lower, position unknown", i);
+    set_phase(i, CalibrationPhase::FAILED);
+    return;
+  } else {
+    // Search in the frame the calibration write path expects
+    // (raw = setpoint + enc_offs_), starting where the lift is now.
+    const double dir_up = mount_dir_[i] ? +1.0 : -1.0;
+    rt.commanded_setpoint = hw_states_positions_[i] * dir_up;
+    rt.lower_start = rt.commanded_setpoint;
+  }
+  RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+              "Joint %zu: lowering (%s)", i,
+              rt.lower_to_zero ? "calibrated, to position 0" : "uncalibrated, searching the bottom");
 }
 
 double CubeMarsSystemHardware::step_calibration(std::size_t i)
@@ -957,8 +989,80 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
       return dir_up * rt.commanded_setpoint;
     }
 
+    case CalibrationPhase::LOWERING: {
+      if (rt.lower_to_zero) {
+        // Calibrated: drive to reported 0, stopping early at the limit sensor.
+        // The controller takes over from position 0 once LOWERED.
+        if (std::abs(hw_states_positions_[i]) < cfg.position_tolerance || rt.limit_sensor_seen) {
+          motor_msgs_[i].calibrate = false;
+          set_phase(i, CalibrationPhase::LOWERED);
+          RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                      "Joint %zu: lowered to %.4f", i, hw_states_positions_[i]);
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        if (now - rt.phase_started >= cfg.phase_timeout) {
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "Joint %zu: LOWERING timed out (pos=%.4f)", i, hw_states_positions_[i]);
+          set_phase(i, CalibrationPhase::FAILED);
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        return 0.0;  // reported frame; the write path adds enc_offs_
+      }
+
+      // Uncalibrated: step down until the bottom is detected, as in FIND_ROOT.
+      const bool gpio_active =
+        global_cfg_.use_limit_sensor && !cfg.gpio_bottom_sensor_ifc_name.empty();
+      const bool timed_out = (now - rt.phase_started >= cfg.phase_timeout);
+      bool bottom_found = gpio_active
+        ? rt.limit_sensor_seen
+        : (cfg.stall_torque > 0.0 && std::abs(hw_states_efforts_[i]) >= cfg.stall_torque);
+      if (!bottom_found && timed_out) {
+        if (gpio_active) {
+          // The limit sensor is the only bottom signal here; never seeing it is a failure.
+          RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                       "Joint %zu: LOWERING timed out before the limit sensor", i);
+          set_phase(i, CalibrationPhase::FAILED);
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu: LOWERING timed out, assuming bottom reached", i);
+        bottom_found = true;
+      }
+      // Overflow backstop on the raw encoder count (enc_offs_ may be non-zero here).
+      const double overflow_thresh_units =
+        (global_cfg_.encoder_overflow_threshold * 0.1 * M_PI / 180.0) *
+        (use_meters_ ? m_per_rad_[i] : 1.0);
+      if (!bottom_found &&
+          std::abs(hw_states_positions_[i] * dir_up + enc_offs_[i]) >= overflow_thresh_units)
+      {
+        RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu: encoder near int16 overflow during LOWERING", i);
+        bottom_found = true;
+      }
+
+      if (bottom_found) {
+        can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+        motor_msgs_[i].calibrate = false;
+        set_phase(i, CalibrationPhase::LOWERED);
+        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                    "Joint %zu: lowered to the bottom", i);
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+
+      // Advance one search step (paced), never more than the range below the start.
+      if (now - rt.last_step >= cfg.step_period) {
+        rt.commanded_setpoint += -dir_up * cfg.search_step;
+        if (std::abs(rt.commanded_setpoint - rt.lower_start) > hardware_limits_[i].range) {
+          rt.commanded_setpoint = rt.lower_start - dir_up * hardware_limits_[i].range;
+        }
+        rt.last_step = now;
+      }
+      return rt.commanded_setpoint;
+    }
+
     case CalibrationPhase::DONE:
     case CalibrationPhase::FAILED:
+    case CalibrationPhase::LOWERED:
     case CalibrationPhase::DEFAULT:
     default:
       return std::numeric_limits<double>::quiet_NaN();
@@ -1113,6 +1217,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
       RCLCPP_WARN_THROTTLE(rclcpp::get_logger("CubeMarsSystemHardware"),
                            *node_->get_clock(), 2000,
                            "Lift OFFLINE: dropping service request");
+      lower_requested_.store(false);
       has_request_.store(false);
     }
     return hardware_interface::return_type::OK;
@@ -1126,6 +1231,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     std::vector<MotorCommandMsg> latest_cmd = command_mailbox_.get();
     bool any_calibration = false;
     bool any_state_change = false;
+    // The action posts lowering as calibrate commands plus this flag.
+    const bool lowering = lower_requested_.exchange(false);
 
     // Map each command to its joint by CAN id (not list position), so a request
     // may target a subset of joints in any order.
@@ -1150,7 +1257,11 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
                        "Joint %zu: cannot calibrate while disabled; send "
                        "set_motor_state=ENABLE first", i);
         } else {
-          enter_calibration(i);
+          if (lowering) {
+            enter_lowering(i);
+          } else {
+            enter_calibration(i);
+          }
           any_calibration = true;
         }
       } else {
@@ -1171,12 +1282,14 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
   if (cancel_calibration_.exchange(false) && is_calibration_running_.load()) {
     for (std::size_t i = 0; i < info_.joints.size(); i++) {
       if (!motor_msgs_[i].calibrate) continue;
+      const bool lowering = calibration_rt_[i].lowering;
       can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
       motor_msgs_[i].calibrate = false;
-      motor_msgs_[i].is_calibrated = false;
+      // A cancelled lowering leaves the calibration as it was.
+      if (!lowering) motor_msgs_[i].is_calibrated = false;
       calibration_rt_[i] = CalibrationRuntime{};
       RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
-                  "Joint %zu: calibration cancelled", i);
+                  "Joint %zu: %s cancelled", i, lowering ? "lowering" : "calibration");
     }
   }
 
@@ -1266,7 +1379,10 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
             RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
                          "Joint %zu: calibration position command out of range: %d",
                          i, position);
-            if (calibration_rt_[i].retry_count >= global_cfg_.max_retries) {
+            // A lowering must not re-zero the encoder, so it fails instead of retrying.
+            if (calibration_rt_[i].lowering ||
+                calibration_rt_[i].retry_count >= global_cfg_.max_retries)
+            {
               set_phase(i, CalibrationPhase::FAILED);
             } else {
               calibration_rt_[i].retry_count += 1;
@@ -1437,6 +1553,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     for (std::size_t i = 0; i < info_.joints.size(); i++) {
       if (motor_msgs_[i].calibrate &&
           calibration_rt_[i].phase != CalibrationPhase::DONE &&
+          calibration_rt_[i].phase != CalibrationPhase::LOWERED &&
           calibration_rt_[i].phase != CalibrationPhase::FAILED)
       {
         any_pending = true;
@@ -1684,6 +1801,7 @@ void CubeMarsSystemHardware::enter_offline_state()
   }
   // Drop any pending service request - it was issued under the previous
   // power-on epoch and is no longer meaningful.
+  lower_requested_.store(false);
   has_request_.store(false);
   is_calibration_running_.store(false);
   is_changing_state_.store(false);
@@ -1763,9 +1881,11 @@ rclcpp_action::GoalResponse CubeMarsSystemHardware::handle_lift_goal(
 rclcpp_action::CancelResponse CubeMarsSystemHardware::handle_lift_cancel(
   const std::shared_ptr<GoalHandleLiftControl> goal_handle)
 {
-  // Only a calibration can be stopped part-way; a state change applies within
-  // a control cycle.
-  return goal_handle->get_goal()->operation == LiftControl::Goal::OPERATION_CALIBRATE
+  // Only a calibration or lowering can be stopped part-way; a state change
+  // applies within a control cycle.
+  const auto operation = goal_handle->get_goal()->operation;
+  return (operation == LiftControl::Goal::OPERATION_CALIBRATE ||
+          operation == LiftControl::Goal::OPERATION_LOWER)
     ? rclcpp_action::CancelResponse::ACCEPT
     : rclcpp_action::CancelResponse::REJECT;
 }
@@ -1796,6 +1916,9 @@ void CubeMarsSystemHardware::execute_lift_goal(
   const auto logger = rclcpp::get_logger("CubeMarsSystemHardware");
   const auto goal = goal_handle->get_goal();
   const bool calibrate = (goal->operation == Goal::OPERATION_CALIBRATE);
+  const bool lower = (goal->operation == Goal::OPERATION_LOWER);
+  // Calibrating and lowering both move the lift through the calibration path.
+  const bool moves = calibrate || lower;
   const std::uint8_t target_state = (goal->operation == Goal::OPERATION_DISABLE)
     ? MotorCommandMsg::DISABLE : MotorCommandMsg::ENABLE;
 
@@ -1860,16 +1983,18 @@ void CubeMarsSystemHardware::execute_lift_goal(
     } else {
       std::vector<MotorCommandMsg> commands;
       for (const std::size_t i : targets) {
-        if (!calibrate && snapshot.joints[i].motor_state == target_state) continue;
+        if (!moves && snapshot.joints[i].motor_state == target_state) continue;
         MotorCommandMsg cmd;
         cmd.can_id = motor_msgs_[i].can_id;
-        cmd.calibrate = calibrate;
-        cmd.set_motor_state = calibrate ? 0 : target_state;
+        cmd.calibrate = moves;
+        cmd.set_motor_state = moves ? 0 : target_state;
         commands.push_back(cmd);
       }
       posted = commands.size();
       if (posted > 0) {
         command_mailbox_.set(commands);
+        // Before has_request_, so write() sees both together.
+        lower_requested_.store(lower);
         has_request_.store(true);
       }
     }
@@ -1891,13 +2016,13 @@ void CubeMarsSystemHardware::execute_lift_goal(
 
   while (true) {
     if (lift_action_stop_.load() || !rclcpp::ok()) {
-      if (calibrate) cancel_calibration_.store(true);
+      if (moves) cancel_calibration_.store(true);
       return finish(Result::ERROR_SHUTDOWN, "Hardware interface shut down");
     }
-    if (calibrate && !cancel_sent && goal_handle->is_canceling()) {
+    if (moves && !cancel_sent && goal_handle->is_canceling()) {
       cancel_calibration_.store(true);
       cancel_sent = true;
-      RCLCPP_INFO(logger, "lift_controller: cancelling calibration");
+      RCLCPP_INFO(logger, "lift_controller: cancelling %s", lift_operation_name(goal->operation));
     }
     if (lift_power_state_.load() == LiftPowerState::OFFLINE) went_offline = true;
 
@@ -1938,7 +2063,8 @@ void CubeMarsSystemHardware::execute_lift_goal(
   if (cancel_sent) {
     // write() consumes the flag while calibrating; clear it if it never ran.
     cancel_calibration_.store(false);
-    return finish(Result::ERROR_CANCELED, "Calibration cancelled");
+    return finish(Result::ERROR_CANCELED, std::string(lift_operation_name(goal->operation)) +
+                  " cancelled");
   }
   if (went_offline || lift_power_state_.load() == LiftPowerState::OFFLINE) {
     return finish(Result::ERROR_LIFT_OFFLINE, "Lift lost power while the goal ran");
@@ -1949,10 +2075,11 @@ void CubeMarsSystemHardware::execute_lift_goal(
     const auto & joint = snapshot.joints[i];
     const bool reached = calibrate
       ? (joint.phase == LiftJointStateMsg::PHASE_DONE && joint.is_calibrated)
-      : (joint.motor_state == target_state);
+      : (lower ? joint.phase == LiftJointStateMsg::PHASE_LOWERED
+               : joint.motor_state == target_state);
     if (reached) continue;
     failed += " CAN " + std::to_string(joint.can_id);
-    if (calibrate) {
+    if (moves) {
       failed += std::string(" (") +
         to_string(static_cast<CalibrationPhase>(joint.phase)) + ")";
     }
@@ -1961,6 +2088,11 @@ void CubeMarsSystemHardware::execute_lift_goal(
     return failed.empty()
       ? finish(Result::ERROR_NONE, "Calibration complete")
       : finish(Result::ERROR_CALIBRATION_FAILED, "Calibration failed for:" + failed);
+  }
+  if (lower) {
+    return failed.empty()
+      ? finish(Result::ERROR_NONE, "Lift lowered")
+      : finish(Result::ERROR_LOWER_FAILED, "Lowering failed for:" + failed);
   }
   return failed.empty()
     ? finish(Result::ERROR_NONE, target_state == MotorCommandMsg::ENABLE

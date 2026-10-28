@@ -53,7 +53,10 @@ namespace cubemars_hardware
             return check;
         };
 
-        const bool calibrate = (operation == Goal::OPERATION_CALIBRATE);
+        // LOWER moves the lift with the calibration settings, so it has the
+        // same eligibility rules as CALIBRATE.
+        const bool calibrate = (operation == Goal::OPERATION_CALIBRATE ||
+                                operation == Goal::OPERATION_LOWER);
         if (!calibrate && operation != Goal::OPERATION_ENABLE &&
             operation != Goal::OPERATION_DISABLE)
         {
@@ -66,7 +69,9 @@ namespace cubemars_hardware
                 if (!calibrate || joints[i].calibration_enabled) check.targets.push_back(i);
             }
             if (check.targets.empty()) {
-                return fail(Result::ERROR_NOT_ELIGIBLE, "No joint is eligible for calibration");
+                return fail(Result::ERROR_NOT_ELIGIBLE,
+                            std::string("No joint is eligible for ") +
+                            (operation == Goal::OPERATION_LOWER ? "lowering" : "calibration"));
             }
         } else {
             std::unordered_set<std::uint8_t> seen;
@@ -82,7 +87,8 @@ namespace cubemars_hardware
                 }
                 if (calibrate && !joints[i].calibration_enabled) {
                     return fail(Result::ERROR_NOT_ELIGIBLE,
-                                "Joint (" + can + ") is not eligible for calibration");
+                                "Joint (" + can + ") is not eligible for " +
+                                (operation == Goal::OPERATION_LOWER ? "lowering" : "calibration"));
                 }
                 check.targets.push_back(i);
             }
@@ -93,7 +99,7 @@ namespace cubemars_hardware
                 if (!joints[i].enabled) {
                     return fail(Result::ERROR_JOINT_DISABLED,
                                 "Joint (CAN " + std::to_string(joints[i].can_id) +
-                                ") is disabled; enable it before calibrating");
+                                ") is disabled; enable it first");
                 }
             }
         }
@@ -113,6 +119,8 @@ namespace cubemars_hardware
             case CalibrationPhase::DONE:            return Msg::PHASE_DONE;
             case CalibrationPhase::FAILED:          return Msg::PHASE_FAILED;
             case CalibrationPhase::SET_RETRY_ZERO:  return Msg::PHASE_SET_RETRY_ZERO;
+            case CalibrationPhase::LOWERING:        return Msg::PHASE_LOWERING;
+            case CalibrationPhase::LOWERED:         return Msg::PHASE_LOWERED;
             case CalibrationPhase::DEFAULT:         return Msg::PHASE_IDLE;
         }
         return Msg::PHASE_IDLE;
@@ -138,6 +146,7 @@ namespace cubemars_hardware
             case Goal::OPERATION_CALIBRATE: return "CALIBRATE";
             case Goal::OPERATION_ENABLE:    return "ENABLE";
             case Goal::OPERATION_DISABLE:   return "DISABLE";
+            case Goal::OPERATION_LOWER:     return "LOWER";
         }
         return "UNKNOWN";
     }

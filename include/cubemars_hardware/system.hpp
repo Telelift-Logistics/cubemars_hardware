@@ -175,6 +175,10 @@ private:
   /// raw encoder frame is the calibration frame.
   void enter_calibration(std::size_t joint_idx);
 
+  /// @brief Start lowering a joint (lift_controller OPERATION_LOWER). Unlike
+  /// enter_calibration, keeps enc_offs_ and is_calibrated.
+  void enter_lowering(std::size_t joint_idx);
+
   /// @brief Transition a joint into a new calibration phase, stamping the
   /// phase start time and logging the transition.
   void set_phase(std::size_t joint_idx, CalibrationPhase new_phase);
@@ -241,6 +245,9 @@ private:
   std::atomic<bool> lift_action_stop_{false};
   /// Set by the action thread to cancel the running calibration; consumed by write().
   std::atomic<bool> cancel_calibration_{false};
+  /// Set with has_request_ by the action thread: the calibrate commands in the
+  /// mailbox lower the joints instead. Consumed by write() with the mailbox.
+  std::atomic<bool> lower_requested_{false};
   /// @brief Makes "check busy + post to the mailbox" atomic between the service
   /// and the action.
   std::mutex request_mutex_;
