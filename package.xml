@@ -18,9 +18,11 @@
   <build_depend>univan_control_msgs</build_depend>
   <build_depend>realtime_tools</build_depend>
   <build_depend>control_msgs</build_depend>
+  <build_depend>univan_db_msgs</build_depend>
   <exec_depend>univan_control_msgs</exec_depend>
   <exec_depend>control_msgs</exec_depend>
   <exec_depend>realtime_tools</exec_depend>
+  <exec_depend>univan_db_msgs</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
