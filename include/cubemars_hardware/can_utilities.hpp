@@ -216,6 +216,12 @@ namespace cubemars_hardware
         bool lower_to_zero{false};
         // Search start (offset frame) of an uncalibrated lowering, to bound its travel.
         double lower_start{0.0};
+        // After a calibration or lowering ends, ignore the controller's position
+        // command until it changes from held_command (its value when the hold
+        // began) or matches hold_target (where the lift was left).
+        bool hold{false};
+        double held_command{std::numeric_limits<double>::quiet_NaN()};
+        double hold_target{std::numeric_limits<double>::quiet_NaN()};
     };
 
     // ---------------------------------------------------------------------------
@@ -259,6 +265,18 @@ namespace cubemars_hardware
     {
         if (std::isfinite(stored) && stored >= 0.0 && stored <= range) return stored;
         return 0.0;
+    }
+
+    /// @brief Whether a hold on the controller's position command ends: the
+    /// command changed from @p held_command (its value when the hold began, NaN
+    /// meaning none) or is within @p tolerance of @p hold_target (where the
+    /// lift was left). A NaN @p command is no command, which keeps the hold.
+    inline bool command_hold_released(
+        double command, double held_command, double hold_target, double tolerance)
+    {
+        if (std::isnan(command)) return false;
+        if (std::isfinite(hold_target) && std::abs(command - hold_target) < tolerance) return true;
+        return std::isnan(held_command) || command != held_command;
     }
 
     /// @brief Return true if Function Block is in RUN state else FALSE
