@@ -179,6 +179,11 @@ private:
   /// enter_calibration, keeps enc_offs_ and is_calibrated.
   void enter_lowering(std::size_t joint_idx);
 
+  /// @brief Hold the joint where a calibration or lowering left it (@p target):
+  /// ignore the controller's (likely stale) position command until it changes
+  /// or matches @p target.
+  void hold_controller_command(std::size_t joint_idx, double target);
+
   /// @brief Transition a joint into a new calibration phase, stamping the
   /// phase start time and logging the transition.
   void set_phase(std::size_t joint_idx, CalibrationPhase new_phase);

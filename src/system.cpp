@@ -754,6 +754,14 @@ void CubeMarsSystemHardware::abort_calibration_failed(std::size_t i)
   motor_msgs_[i].get_motor_state = MotorCommandMsg::DISABLE;
 }
 
+void CubeMarsSystemHardware::hold_controller_command(std::size_t i, double target)
+{
+  auto & rt = calibration_rt_[i];
+  rt.hold = true;
+  rt.held_command = hw_commands_positions_[i];
+  rt.hold_target = target;
+}
+
 void CubeMarsSystemHardware::enter_lowering(std::size_t i)
 {
   // Lowering moves relative to the current position and never re-zeroes the
@@ -886,6 +894,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         motor_msgs_[i].is_calibrated = true;
         motor_msgs_[i].calibrate = false;
         set_phase(i, CalibrationPhase::DONE);
+        hold_controller_command(i, 0.0);
         RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
                     "Joint %zu: calibration DONE (bottom zero, enc_off=0.0)", i);
         return std::numeric_limits<double>::quiet_NaN();
@@ -973,6 +982,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         motor_msgs_[i].is_calibrated = true;
         motor_msgs_[i].calibrate = false;
         set_phase(i, CalibrationPhase::DONE);
+        hold_controller_command(i, rt.commanded_setpoint);
         RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
                     "Joint %zu: calibration DONE at %.4f (enc_off=%.4f)",
                     i, rt.commanded_setpoint, enc_offs_[i]);
@@ -996,6 +1006,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         if (std::abs(hw_states_positions_[i]) < cfg.position_tolerance || rt.limit_sensor_seen) {
           motor_msgs_[i].calibrate = false;
           set_phase(i, CalibrationPhase::LOWERED);
+          hold_controller_command(i, 0.0);
           RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
                       "Joint %zu: lowered to %.4f", i, hw_states_positions_[i]);
           return std::numeric_limits<double>::quiet_NaN();
@@ -1288,6 +1299,11 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
       // A cancelled lowering leaves the calibration as it was.
       if (!lowering) motor_msgs_[i].is_calibrated = false;
       calibration_rt_[i] = CalibrationRuntime{};
+      // A calibrated lift stays where it stopped instead of following the
+      // controller's command from before the lowering.
+      if (motor_msgs_[i].is_calibrated && std::isfinite(hw_states_positions_[i])) {
+        hold_controller_command(i, hw_states_positions_[i]);
+      }
       RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
                   "Joint %zu: %s cancelled", i, lowering ? "lowering" : "calibration");
     }
@@ -1427,6 +1443,25 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
         *node_->get_clock(), 5000,
         "Joint %zu: ignoring command, not calibrated", i);
       continue;
+    }
+
+    // ---- Hold after a calibration or lowering ----
+    // The position controller keeps re-sending its last command, e.g. the
+    // height before a lowering. Ignore it until it changes or matches where
+    // the lift was left; any other control mode ends the hold.
+    if (calibration_rt_[i].hold) {
+      auto & hold_rt = calibration_rt_[i];
+      const bool position_mode =
+        control_mode_[i] == POSITION_SPEED_LOOP || control_mode_[i] == POSITION_LOOP;
+      if (position_mode && !command_hold_released(
+          hw_commands_positions_[i], hold_rt.held_command, hold_rt.hold_target,
+          calibration_cfg_[i].position_tolerance))
+      {
+        continue;
+      }
+      hold_rt.hold = false;
+      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Joint %zu: following the controller command again", i);
     }
 
     // ---- Normal operation ----
