@@ -14,6 +14,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   univan_control_msgs
   realtime_tools
   control_msgs
+  univan_db_msgs
 )
 find_package(ament_cmake REQUIRED)
 foreach(Dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
@@ -62,6 +63,10 @@ if(BUILD_TESTING)
   target_include_directories(test_limit_sensor PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   target_compile_features(test_limit_sensor PUBLIC cxx_std_17)
+  ament_add_gtest(test_calibration_target test/test_calibration_target.cpp)
+  target_include_directories(test_calibration_target PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_features(test_calibration_target PUBLIC cxx_std_17)
 endif()
 
 ## EXPORTS

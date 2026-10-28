@@ -233,6 +233,15 @@ namespace cubemars_hardware
         return cmd;
     }
 
+    /// @brief Where calibration finishes after SET_MID_ZERO (reported frame):
+    /// the stored position when it is finite and within [0, range], else the
+    /// bottom (0).
+    inline double calibration_return_target(double stored, double range)
+    {
+        if (std::isfinite(stored) && stored >= 0.0 && stored <= range) return stored;
+        return 0.0;
+    }
+
     /// @brief Return true if Function Block is in RUN state else FALSE
     inline bool check_fb_enabled(std::uint8_t state)
     {
