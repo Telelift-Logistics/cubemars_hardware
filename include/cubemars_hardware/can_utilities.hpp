@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace cubemars_hardware
@@ -197,6 +198,8 @@ namespace cubemars_hardware
         double commanded_setpoint{0.0}; // raw-frame setpoint being driven to
         std::chrono::steady_clock::time_point mode_wait_started{}; // epoch = not waiting for position mode
         std::uint16_t retry_count{0};   // out-of-range retries used this run
+        // Where this run finishes (reported frame); NaN until SET_MID_ZERO picks it.
+        double target_position{std::numeric_limits<double>::quiet_NaN()};
     };
 
     // ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  rclcpp_action
   univan_control_msgs
   realtime_tools
   control_msgs
@@ -67,6 +68,11 @@ if(BUILD_TESTING)
   target_include_directories(test_calibration_target PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   target_compile_features(test_calibration_target PUBLIC cxx_std_17)
+  ament_add_gtest(test_lift_action test/test_lift_action.cpp)
+  target_include_directories(test_lift_action PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_features(test_lift_action PUBLIC cxx_std_17)
+  ament_target_dependencies(test_lift_action univan_control_msgs)
 endif()
 
 ## EXPORTS

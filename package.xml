@@ -14,6 +14,7 @@
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
+  <depend>rclcpp_action</depend>
   
   <build_depend>univan_control_msgs</build_depend>
   <build_depend>realtime_tools</build_depend>
