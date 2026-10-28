@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -17,11 +19,13 @@
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 #include "rclcpp/macros.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "cubemars_hardware/visibility_control.h"
 #include "cubemars_hardware/can.hpp"
 #include "cubemars_hardware/can_utilities.hpp"
+#include "cubemars_hardware/lift_action_utils.hpp"
 
 #include "realtime_tools/realtime_publisher.hpp"
 #include "realtime_tools/realtime_thread_safe_box.hpp"
@@ -94,6 +98,10 @@ private:
   using MotorCommandGrp = univan_control_msgs::msg::MotorCommandGroup;
 
   using ControlMessage = control_msgs::msg::DynamicInterfaceGroupValues;
+
+  using LiftControl = univan_control_msgs::action::LiftControl;
+  using GoalHandleLiftControl = rclcpp_action::ServerGoalHandle<LiftControl>;
+  using LiftJointStateMsg = univan_control_msgs::msg::LiftJointState;
 
   using DBGetLiftState = univan_db_msgs::srv::DBGetLiftState;
   using DBSetLiftState = univan_db_msgs::srv::DBSetLiftState;
@@ -212,6 +220,42 @@ private:
   bool lift_state_loaded_{false};
   bool lift_state_request_pending_{false};
   std::chrono::steady_clock::time_point lift_state_request_sent_{};
+
+  // ---- lift_controller action (supersedes the lift_platform_hardware service) ----
+  /// @brief Per-joint state published by read() (RT thread) each cycle for the
+  /// action thread. seq increases with every publish.
+  struct LiftSnapshot
+  {
+    std::uint64_t seq{0};
+    std::vector<LiftJointStateMsg> joints;
+  };
+  /// RT-only scratch; sized and named once in on_init so publishing never allocates.
+  LiftSnapshot lift_snapshot_scratch_;
+  realtime_tools::RealtimeThreadSafeBox<LiftSnapshot> lift_snapshot_;
+
+  rclcpp::CallbackGroup::SharedPtr action_callback_group_;
+  rclcpp_action::Server<LiftControl>::SharedPtr lift_action_server_;
+  std::thread lift_action_thread_;
+  std::atomic<bool> lift_action_active_{false};
+  /// Set by on_cleanup to end a running goal.
+  std::atomic<bool> lift_action_stop_{false};
+  /// Set by the action thread to cancel the running calibration; consumed by write().
+  std::atomic<bool> cancel_calibration_{false};
+  /// @brief Makes "check busy + post to the mailbox" atomic between the service
+  /// and the action.
+  std::mutex request_mutex_;
+
+  /// @brief RT: copy the per-joint state into lift_snapshot_ (non-blocking).
+  void publish_lift_snapshot();
+
+  rclcpp_action::GoalResponse handle_lift_goal(
+    const rclcpp_action::GoalUUID & uuid, std::shared_ptr<const LiftControl::Goal> goal);
+  rclcpp_action::CancelResponse handle_lift_cancel(
+    const std::shared_ptr<GoalHandleLiftControl> goal_handle);
+  void handle_lift_accepted(const std::shared_ptr<GoalHandleLiftControl> goal_handle);
+  /// @brief Runs one goal on lift_action_thread_: validate, post it to the
+  /// mailbox, then report feedback until write() has finished it.
+  void execute_lift_goal(const std::shared_ptr<GoalHandleLiftControl> goal_handle);
 
   /// @brief Periodic (node thread): load the stored lift position once, then
   /// persist the current calibrated position whenever it changes.

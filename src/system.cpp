@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -419,6 +420,28 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
               std::placeholders::_1, std::placeholders::_2),
     rclcpp::ServicesQoS(), srv_callback_group_);
 
+    // lift_controller action. Names and CAN ids are fixed here, so read() only
+    // refreshes the live fields and publishing the snapshot never allocates.
+    lift_snapshot_scratch_.joints.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      auto & joint = lift_snapshot_scratch_.joints[i];
+      joint.can_id = motor_msgs_[i].can_id;
+      joint.joint_name = info_.joints[i].name;
+      joint.motor_state = MotorCommandMsg::ENABLE;
+      joint.position = std::numeric_limits<double>::quiet_NaN();
+      joint.target_position = std::numeric_limits<double>::quiet_NaN();
+    }
+    lift_snapshot_.set(lift_snapshot_scratch_);
+    action_callback_group_ =
+      node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    lift_action_server_ = rclcpp_action::create_server<LiftControl>(
+      node_, "lift_controller",
+      std::bind(&CubeMarsSystemHardware::handle_lift_goal, this,
+                std::placeholders::_1, std::placeholders::_2),
+      std::bind(&CubeMarsSystemHardware::handle_lift_cancel, this, std::placeholders::_1),
+      std::bind(&CubeMarsSystemHardware::handle_lift_accepted, this, std::placeholders::_1),
+      rcl_action_server_get_default_options(), action_callback_group_);
+
     if (global_cfg_.use_limit_sensor) {
       sub_gpio_states_ = node_->create_subscription<ControlMessage>(
         global_cfg_.gpio_states_topic,
@@ -494,6 +517,10 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_configure(
 hardware_interface::CallbackReturn CubeMarsSystemHardware::on_cleanup(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  // End a running lift_controller goal before its node goes away.
+  lift_action_stop_.store(true);
+  if (lift_action_thread_.joinable()) lift_action_thread_.join();
+
   if (node_) {
     if (auto locked_executor = executor_weak_.lock()) {
       try {
@@ -823,6 +850,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         // no second move — calibration is complete. Trades int16 headroom (raw
         // spans [0, range] instead of +/- half_range) for a shorter, safer run.
         enc_offs_[i] = 0.0;
+        rt.target_position = 0.0;
         motor_msgs_[i].is_calibrated = true;
         motor_msgs_[i].calibrate = false;
         set_phase(i, CalibrationPhase::DONE);
@@ -894,6 +922,7 @@ double CubeMarsSystemHardware::step_calibration(std::size_t i)
         const double stored = stored_positions_[i].load();
         rt.commanded_setpoint =
           calibration_return_target(stored, hardware_limits_[i].range);
+        rt.target_position = rt.commanded_setpoint;
         if (rt.commanded_setpoint != stored) {
           RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
                       "Joint %zu: no valid stored position (%.4f); returning to bottom",
@@ -1065,6 +1094,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
     motor_msg_grp_.commands.clear();
   }
 
+  publish_lift_snapshot();
+
   return hardware_interface::return_type::OK;
 }
 
@@ -1131,6 +1162,22 @@ hardware_interface::return_type CubeMarsSystemHardware::write(
     if (any_calibration) is_calibration_running_.store(true);
     if (any_state_change) is_changing_state_.store(true);
     has_request_.store(false);
+  }
+
+  // ---- Cancel the running calibration (lift_controller action) ----
+  // Stop the motion and end calibration, leaving the joints enabled but
+  // uncalibrated. Handled after the mailbox so a calibration consumed this
+  // cycle is cancelled too.
+  if (cancel_calibration_.exchange(false) && is_calibration_running_.load()) {
+    for (std::size_t i = 0; i < info_.joints.size(); i++) {
+      if (!motor_msgs_[i].calibrate) continue;
+      can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, ZEROCMD, 4);
+      motor_msgs_[i].calibrate = false;
+      motor_msgs_[i].is_calibrated = false;
+      calibration_rt_[i] = CalibrationRuntime{};
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Joint %zu: calibration cancelled", i);
+    }
   }
 
   // ---- Per-joint command emission ----
@@ -1436,6 +1483,9 @@ void CubeMarsSystemHardware::motor_control_callback(
     return;
   }
 
+  // Held until the request is posted, so the lift_controller action cannot
+  // claim the mailbox between the busy check and the post.
+  std::unique_lock<std::mutex> lock(request_mutex_);
   if (has_request_.load() || is_calibration_running_.load() ||
       is_changing_state_.load())
   {
@@ -1518,6 +1568,7 @@ void CubeMarsSystemHardware::motor_control_callback(
 
   command_mailbox_.set(request->commands);
   has_request_.store(true);
+  lock.unlock();
 
   if (!trigger_calibration) {
     response->success = true;
@@ -1673,6 +1724,248 @@ void CubeMarsSystemHardware::enter_recovering_state()
     RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
                 "Auto-recalibration queued");
   }
+}
+
+// ============================================================================
+// lift_controller action
+// ============================================================================
+void CubeMarsSystemHardware::publish_lift_snapshot()
+{
+  auto & snapshot = lift_snapshot_scratch_;
+  ++snapshot.seq;
+  for (std::size_t i = 0; i < info_.joints.size(); ++i) {
+    auto & joint = snapshot.joints[i];
+    const auto & rt = calibration_rt_[i];
+    joint.phase = to_phase_msg(rt.phase);
+    joint.waiting_for_position_mode = rt.mode_wait_started.time_since_epoch().count() != 0;
+    joint.retry_count = rt.retry_count;
+    joint.motor_state = motor_msgs_[i].get_motor_state;
+    joint.is_calibrated = motor_msgs_[i].is_calibrated;
+    joint.at_lower_limit =
+      (i < 64) && (((limit_active_mask_.load() >> i) & 1ULL) != 0ULL);
+    joint.position = hw_states_positions_[i];
+    joint.target_position = rt.target_position;
+  }
+  // Non-blocking: if the action thread holds the box, the next cycle publishes.
+  (void)lift_snapshot_.try_set(snapshot);
+}
+
+rclcpp_action::GoalResponse CubeMarsSystemHardware::handle_lift_goal(
+  const rclcpp_action::GoalUUID & /*uuid*/, std::shared_ptr<const LiftControl::Goal> goal)
+{
+  // Every goal is accepted so that a refusal can carry its reason in the result.
+  RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+              "lift_controller: %s goal received (%zu CAN ids)",
+              lift_operation_name(goal->operation), goal->can_ids.size());
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse CubeMarsSystemHardware::handle_lift_cancel(
+  const std::shared_ptr<GoalHandleLiftControl> goal_handle)
+{
+  // Only a calibration can be stopped part-way; a state change applies within
+  // a control cycle.
+  return goal_handle->get_goal()->operation == LiftControl::Goal::OPERATION_CALIBRATE
+    ? rclcpp_action::CancelResponse::ACCEPT
+    : rclcpp_action::CancelResponse::REJECT;
+}
+
+void CubeMarsSystemHardware::handle_lift_accepted(
+  const std::shared_ptr<GoalHandleLiftControl> goal_handle)
+{
+  // One goal at a time. action_callback_group_ serializes these callbacks.
+  if (lift_action_active_.load()) {
+    auto result = std::make_shared<LiftControl::Result>();
+    result->error_code = LiftControl::Result::ERROR_BUSY;
+    result->error_msg = "Another lift_controller goal is running";
+    goal_handle->abort(result);
+    return;
+  }
+  // The previous goal has finished (lift_action_active_ is down); reap its thread.
+  if (lift_action_thread_.joinable()) lift_action_thread_.join();
+  lift_action_active_.store(true);
+  lift_action_thread_ = std::thread(
+    [this, goal_handle]() {execute_lift_goal(goal_handle);});
+}
+
+void CubeMarsSystemHardware::execute_lift_goal(
+  const std::shared_ptr<GoalHandleLiftControl> goal_handle)
+{
+  using Goal = LiftControl::Goal;
+  using Result = LiftControl::Result;
+  const auto logger = rclcpp::get_logger("CubeMarsSystemHardware");
+  const auto goal = goal_handle->get_goal();
+  const bool calibrate = (goal->operation == Goal::OPERATION_CALIBRATE);
+  const std::uint8_t target_state = (goal->operation == Goal::OPERATION_DISABLE)
+    ? MotorCommandMsg::DISABLE : MotorCommandMsg::ENABLE;
+
+  auto result = std::make_shared<Result>();
+  LiftSnapshot snapshot = lift_snapshot_.get();
+  std::vector<std::size_t> targets;
+
+  // Ends the goal. lift_action_active_ drops first, so a client reacting to
+  // the result can send its next goal straight away.
+  auto finish = [&](std::uint8_t code, const std::string & msg) {
+    result->error_code = code;
+    result->error_msg = msg;
+    for (const std::size_t i : targets) result->joints.push_back(snapshot.joints[i]);
+    lift_action_active_.store(false);
+    // At shutdown the context may already be gone; an exception escaping this
+    // thread would terminate the process.
+    try {
+      if (code == Result::ERROR_NONE) {
+        RCLCPP_INFO(logger, "lift_controller: %s succeeded: %s",
+                    lift_operation_name(goal->operation), msg.c_str());
+        goal_handle->succeed(result);
+      } else if (code == Result::ERROR_CANCELED) {
+        RCLCPP_WARN(logger, "lift_controller: %s cancelled", lift_operation_name(goal->operation));
+        goal_handle->canceled(result);
+      } else {
+        RCLCPP_WARN(logger, "lift_controller: %s aborted: %s",
+                    lift_operation_name(goal->operation), msg.c_str());
+        goal_handle->abort(result);
+      }
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(logger, "lift_controller: could not report the result: %s", e.what());
+    }
+  };
+
+  if (lift_power_state_.load() == LiftPowerState::OFFLINE) {
+    return finish(Result::ERROR_LIFT_OFFLINE, "Lift is OFFLINE (power lost)");
+  }
+
+  std::vector<LiftJointView> joints(info_.joints.size());
+  for (std::size_t i = 0; i < joints.size(); ++i) {
+    joints[i].can_id = motor_msgs_[i].can_id;
+    joints[i].calibration_enabled = calibration_cfg_[i].enabled;
+    joints[i].enabled = (snapshot.joints[i].motor_state == MotorCommandMsg::ENABLE);
+  }
+  const LiftGoalCheck check = check_lift_goal(goal->operation, goal->can_ids, joints);
+  if (check.error_code != Result::ERROR_NONE) {
+    return finish(check.error_code, check.error_msg);
+  }
+  targets = check.targets;
+
+  // Claim the mailbox under the same lock as the service. A joint already in
+  // the requested motor state is left out: write() would never clear a
+  // DISABLE request for a disabled joint, wedging is_changing_state_.
+  std::string busy;
+  std::size_t posted = 0;
+  {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    if (has_request_.load() || is_calibration_running_.load() || is_changing_state_.load()) {
+      busy = is_calibration_running_.load() ? "Calibration in progress"
+        : (is_changing_state_.load() ? "Motor state change in progress"
+                                     : "Previous request still pending");
+    } else {
+      std::vector<MotorCommandMsg> commands;
+      for (const std::size_t i : targets) {
+        if (!calibrate && snapshot.joints[i].motor_state == target_state) continue;
+        MotorCommandMsg cmd;
+        cmd.can_id = motor_msgs_[i].can_id;
+        cmd.calibrate = calibrate;
+        cmd.set_motor_state = calibrate ? 0 : target_state;
+        commands.push_back(cmd);
+      }
+      posted = commands.size();
+      if (posted > 0) {
+        command_mailbox_.set(commands);
+        has_request_.store(true);
+      }
+    }
+  }
+  if (!busy.empty()) return finish(Result::ERROR_BUSY, busy);
+  if (posted == 0) return finish(Result::ERROR_NONE, "Already in the requested motor state");
+  RCLCPP_INFO(logger, "lift_controller: %s started on %zu joint(s)",
+              lift_operation_name(goal->operation), posted);
+
+  auto feedback = std::make_shared<LiftControl::Feedback>();
+  feedback->operation = goal->operation;
+  std::vector<std::uint8_t> last_phase(info_.joints.size(), 0xFF);
+  auto last_feedback = std::chrono::steady_clock::time_point{};
+  bool cancel_sent = false;
+  bool went_offline = false;
+  // Snapshot seq once the request is no longer busy. Only a later snapshot is
+  // guaranteed to come from a read() after write() finished the request.
+  std::optional<std::uint64_t> settled_seq;
+
+  while (true) {
+    if (lift_action_stop_.load() || !rclcpp::ok()) {
+      if (calibrate) cancel_calibration_.store(true);
+      return finish(Result::ERROR_SHUTDOWN, "Hardware interface shut down");
+    }
+    if (calibrate && !cancel_sent && goal_handle->is_canceling()) {
+      cancel_calibration_.store(true);
+      cancel_sent = true;
+      RCLCPP_INFO(logger, "lift_controller: cancelling calibration");
+    }
+    if (lift_power_state_.load() == LiftPowerState::OFFLINE) went_offline = true;
+
+    const bool request_busy = has_request_.load() || is_calibration_running_.load() ||
+      is_changing_state_.load();
+    if (request_busy) {
+      settled_seq.reset();
+    } else if (!settled_seq) {
+      settled_seq = lift_snapshot_.get().seq;
+    }
+
+    if (auto latest = lift_snapshot_.try_get()) snapshot = std::move(*latest);
+    if (settled_seq && snapshot.seq > *settled_seq) break;
+
+    // Feedback on any phase change of a targeted joint, and at 10 Hz.
+    bool phase_changed = false;
+    for (const std::size_t i : targets) {
+      if (snapshot.joints[i].phase != last_phase[i]) {
+        last_phase[i] = snapshot.joints[i].phase;
+        phase_changed = true;
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (phase_changed || now - last_feedback >= std::chrono::milliseconds(100)) {
+      feedback->power_state = to_power_state_msg(lift_power_state_.load());
+      feedback->joints.clear();
+      for (const std::size_t i : targets) feedback->joints.push_back(snapshot.joints[i]);
+      try {
+        goal_handle->publish_feedback(feedback);
+      } catch (const std::exception & e) {
+        RCLCPP_WARN(logger, "lift_controller: could not publish feedback: %s", e.what());
+      }
+      last_feedback = now;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  if (cancel_sent) {
+    // write() consumes the flag while calibrating; clear it if it never ran.
+    cancel_calibration_.store(false);
+    return finish(Result::ERROR_CANCELED, "Calibration cancelled");
+  }
+  if (went_offline || lift_power_state_.load() == LiftPowerState::OFFLINE) {
+    return finish(Result::ERROR_LIFT_OFFLINE, "Lift lost power while the goal ran");
+  }
+
+  std::string failed;
+  for (const std::size_t i : targets) {
+    const auto & joint = snapshot.joints[i];
+    const bool reached = calibrate
+      ? (joint.phase == LiftJointStateMsg::PHASE_DONE && joint.is_calibrated)
+      : (joint.motor_state == target_state);
+    if (reached) continue;
+    failed += " CAN " + std::to_string(joint.can_id);
+    if (calibrate) {
+      failed += std::string(" (") +
+        to_string(static_cast<CalibrationPhase>(joint.phase)) + ")";
+    }
+  }
+  if (calibrate) {
+    return failed.empty()
+      ? finish(Result::ERROR_NONE, "Calibration complete")
+      : finish(Result::ERROR_CALIBRATION_FAILED, "Calibration failed for:" + failed);
+  }
+  return failed.empty()
+    ? finish(Result::ERROR_NONE, target_state == MotorCommandMsg::ENABLE
+             ? "Motors enabled" : "Motors disabled")
+    : finish(Result::ERROR_FAILED, "Motor state not applied for:" + failed);
 }
 
 void CubeMarsSystemHardware::sync_lift_state()
