@@ -32,7 +32,9 @@
 #include "univan_control_msgs/msg/motor_command.hpp"
 #include "univan_control_msgs/msg/motor_command_group.hpp"
 #include "univan_control_msgs/srv/motor_control_service.hpp"
+#include "univan_control_msgs/srv/set_safety_state.hpp"
 #include "control_msgs/msg/dynamic_interface_group_values.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "univan_db_msgs/srv/db_get_lift_state.hpp"
 #include "univan_db_msgs/srv/db_set_lift_state.hpp"
 
@@ -230,6 +232,14 @@ private:
   bool lift_state_request_pending_{false};
   std::chrono::steady_clock::time_point lift_state_request_sent_{};
 
+  // ---- trolley sensor override during calibration (safety node) ----
+  rclcpp::Client<univan_control_msgs::srv::SetSafetyState>::SharedPtr safety_state_client_;
+  rclcpp::TimerBase::SharedPtr trolley_override_timer_;
+  /// Node-thread only. Override state last confirmed by the safety node.
+  bool trolley_override_active_{false};
+  bool trolley_override_request_pending_{false};
+  std::chrono::steady_clock::time_point trolley_override_request_sent_{};
+
   // ---- lift_controller action (supersedes the lift_platform_hardware service) ----
   /// @brief Per-joint state published by read() (RT thread) each cycle for the
   /// action thread. seq increases with every publish.
@@ -273,6 +283,12 @@ private:
   /// persist the current calibrated position whenever it changes.
   void sync_lift_state();
 
+  /// @brief Keeps the safety node's trolley sensor override on while a calibration runs
+  /// (SAFE_ENABLE_MAGNETIC_SENSORS) and clears it afterwards
+  /// (SAFE_CLEAR_MAGNETIC_SENSORS_OVERRIDE), so the lift calibrates without a trolley or magnet
+  /// present. Runs on a node timer and retries until the safety node confirms.
+  void sync_trolley_override();
+
   /// @brief Weak reference to the ControllerManager's executor (provided
   /// through HardwareComponentInterfaceParams). The CM spins our `node_`
   /// for us; we do NOT spawn our own thread.
@@ -284,9 +300,11 @@ private:
   std::vector<MotorCommandMsg> motor_msgs_;
   MotorCommandGrp motor_msg_grp_;
 
-  /// @brief Realtime SAFE stop publisher
-  std::unique_ptr<realtime_tools::RealtimePublisher<ControlMessage>> rt_pub_gpio_command_;
-   std::shared_ptr<rclcpp::Publisher<ControlMessage>> pub_gpio_command_;
+  /// @brief Realtime STOP_LIFT request publisher, read by the safety node.
+  std::unique_ptr<realtime_tools::RealtimePublisher<std_msgs::msg::Bool>> rt_pub_stop_lift_;
+  std::shared_ptr<rclcpp::Publisher<std_msgs::msg::Bool>> pub_stop_lift_;
+  /// @brief STOP_LIFT request still to publish: -1 none, 0 clear, 1 set.
+  std::atomic<int> pending_stop_lift_{-1};
 
   // ---- top-level flags ----
   std::atomic<bool> is_calibration_running_{false};
@@ -312,8 +330,6 @@ private:
     bool auto_calibrate_on_activate{false};
     /// @brief Topic to subscribe to for GPIO sensor states.
     std::string gpio_states_topic{"gpio_controller/gpio_states"};
-    /// @brief to publish GPIO commands.
-    std::string gpio_cmd_topic{"gpio_controller/commands"};
     /// @brief Topic for publishing Lift motor states
     std::string status_topic{"lift_position_controller/status"};
     /// @brief univan_db_interface services persisting the lift position.
@@ -325,9 +341,12 @@ private:
     /// @brief Lower Limit Sensor (INPUT)
     std::string gpio_limit_group_name{};
     std::string gpio_limit_ifc_name{};
-    /// @brief SAFE Stop "STOP_LIFT" (OUTPUT)
-    std::string gpio_stop_lift_group_name{};
-    std::string gpio_stop_lift_ifc_name{};
+    /// @brief Topic on which STOP_LIFT is requested from the safety node, which owns the
+    /// bridge register. Empty disables SAFE stop publishing.
+    std::string stop_lift_topic{};
+    /// @brief Safety node SetSafetyState service, used to override the trolley magnetic sensors
+    /// while a calibration runs. Empty disables the override.
+    std::string safety_state_service{};
     /// Hard ceiling on int16 encoder count where we declare "overflow imminent".
     /// CubeMars reports position as int16 centidegrees; ±32000 ≈ ±320°.
     std::int16_t encoder_overflow_threshold{32000};
@@ -381,9 +400,12 @@ private:
   /// calibration request or just log that we're awaiting one.
   void enter_recovering_state();
 
-  /// @brief Publisher to trigger SAFE stop.
-  /// Called from read() each cycle.
+  /// @brief Requests STOP_LIFT set or cleared from the safety node.
   void enter_safe_state(const bool &set = true);
+
+  /// @brief Publishes the pending STOP_LIFT request, if any. Called from read() each cycle, so
+  /// a request the realtime publisher could not take yet is retried.
+  void publish_pending_stop_lift();
 
   /// @brief Update the reported position, velocity and effort states exposed to ROS 2 control.
   void update_reported_states();
