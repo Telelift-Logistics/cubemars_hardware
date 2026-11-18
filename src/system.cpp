@@ -98,8 +98,6 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       (get_hw_param_int(info_, "auto_calibrate", 0) == 1);
     global_cfg_.gpio_states_topic =
       get_hw_param_str(info_, "gpio_states_topic", "gpio_controller/gpio_states");
-    global_cfg_.gpio_cmd_topic =
-      get_hw_param_str(info_, "gpio_cmd_topic", "gpio_controller/commands");
     global_cfg_.status_topic =
       get_hw_param_str(info_, "status_topic", "lift_position_controller/status");
     global_cfg_.db_get_lift_state_service = get_hw_param_str(
@@ -155,18 +153,8 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       return hardware_interface::CallbackReturn::ERROR;
     }
 
-    global_cfg_.gpio_stop_lift_group_name =
-      get_hw_param_str(info_, "gpio_stop_lift_group_name", "");
-    global_cfg_.gpio_stop_lift_ifc_name =
-      get_hw_param_str(info_, "gpio_stop_lift_ifc_name", "");
-    if (global_cfg_.gpio_stop_lift_group_name.empty() !=
-        global_cfg_.gpio_stop_lift_ifc_name.empty())
-    {
-      RCLCPP_FATAL(rclcpp::get_logger("CubeMarsSystemHardware"),
-                  "gpio_stop_lift_group_name and gpio_stop_lift_ifc_name must be "
-                  "set together (or both empty to disable SAFE stop publishing)");
-      return hardware_interface::CallbackReturn::ERROR;
-    }
+    global_cfg_.stop_lift_topic = get_hw_param_str(info_, "stop_lift_topic", "");
+    global_cfg_.safety_state_service = get_hw_param_str(info_, "safety_state_service", "");
 
     global_cfg_.power_loss_timeout = std::chrono::milliseconds(
       get_hw_param_int(info_, "power_loss_timeout_ms", 500));
@@ -457,10 +445,14 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       rt_state_publisher_ =
         std::make_unique<realtime_tools::RealtimePublisher<MotorCommandGrp>>(s_publisher_);
 
-      pub_gpio_command_ = node_->create_publisher<ControlMessage>(
-        std::string(global_cfg_.gpio_cmd_topic), rclcpp::SystemDefaultsQoS());
-      rt_pub_gpio_command_ =
-        std::make_unique<realtime_tools::RealtimePublisher<ControlMessage>>(pub_gpio_command_);
+      if (!global_cfg_.stop_lift_topic.empty()) {
+        // Transient local, so a restarted safety node still gets the latest request.
+        pub_stop_lift_ = node_->create_publisher<std_msgs::msg::Bool>(
+          global_cfg_.stop_lift_topic, rclcpp::QoS(1).reliable().transient_local());
+        rt_pub_stop_lift_ =
+          std::make_unique<realtime_tools::RealtimePublisher<std_msgs::msg::Bool>>(
+            pub_stop_lift_);
+      }
     }
 
     // Lift position persistence: calibration finishes at the stored position.
@@ -470,6 +462,14 @@ hardware_interface::CallbackReturn CubeMarsSystemHardware::on_init(
       node_->create_client<DBSetLiftState>(global_cfg_.db_set_lift_state_service);
     lift_state_timer_ = node_->create_wall_timer(
       std::chrono::seconds(1), std::bind(&CubeMarsSystemHardware::sync_lift_state, this));
+
+    if (!global_cfg_.safety_state_service.empty()) {
+      safety_state_client_ = node_->create_client<univan_control_msgs::srv::SetSafetyState>(
+        global_cfg_.safety_state_service);
+      trolley_override_timer_ = node_->create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&CubeMarsSystemHardware::sync_trolley_override, this));
+    }
 
 
     // Register the custom node into the ControllerManager's executor hierarchy
@@ -1087,6 +1087,8 @@ hardware_interface::return_type CubeMarsSystemHardware::read(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
   const bool offline = (lift_power_state_.load() == LiftPowerState::OFFLINE);
+
+  publish_pending_stop_lift();
 
   std::vector<bool> all_ids(can_ids_.size(), false);
   std::uint32_t read_id;
@@ -2215,6 +2217,56 @@ void CubeMarsSystemHardware::sync_lift_state()
   }
 }
 
+void CubeMarsSystemHardware::sync_trolley_override()
+{
+  using SetSafetyState = univan_control_msgs::srv::SetSafetyState;
+
+  // One request in flight at a time; a server that never answers is given up on.
+  if (trolley_override_request_pending_) {
+    if (std::chrono::steady_clock::now() - trolley_override_request_sent_ <
+      std::chrono::seconds(5))
+    {
+      return;
+    }
+    safety_state_client_->prune_pending_requests();
+    trolley_override_request_pending_ = false;
+  }
+
+  const bool wanted = is_calibration_running_.load();
+  if (wanted == trolley_override_active_) {
+    return;
+  }
+  if (!safety_state_client_->service_is_ready()) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+                         "Waiting for %s; trolley sensor override not %s",
+                         global_cfg_.safety_state_service.c_str(),
+                         wanted ? "set" : "cleared");
+    return;
+  }
+
+  auto request = std::make_shared<SetSafetyState::Request>();
+  request->action = wanted ? SetSafetyState::Request::SAFE_ENABLE_MAGNETIC_SENSORS :
+    SetSafetyState::Request::SAFE_CLEAR_MAGNETIC_SENSORS_OVERRIDE;
+  trolley_override_request_pending_ = true;
+  trolley_override_request_sent_ = std::chrono::steady_clock::now();
+  safety_state_client_->async_send_request(
+    request,
+    [this, wanted](rclcpp::Client<SetSafetyState>::SharedFuture future) {
+      trolley_override_request_pending_ = false;
+      const auto response = future.get();
+      if (!response->success) {
+        // Retried on the next tick.
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+                             "Could not %s the trolley sensor override: %s",
+                             wanted ? "set" : "clear", response->message.c_str());
+        return;
+      }
+      trolley_override_active_ = wanted;
+      RCLCPP_INFO(node_->get_logger(), "Trolley sensor override %s for the calibration.",
+                  wanted ? "set" : "cleared");
+    });
+}
+
 void CubeMarsSystemHardware::update_power_state()
 {
   const auto now = std::chrono::steady_clock::now();
@@ -2292,20 +2344,25 @@ void CubeMarsSystemHardware::update_power_state()
 
 void CubeMarsSystemHardware::enter_safe_state(const bool &set)
 {
-  if(!global_cfg_.gpio_stop_lift_group_name.empty() &&
-      !global_cfg_.gpio_stop_lift_group_name.empty())
-  {
-    // Create a message to the safety sequence.
-    auto dynamic_interface_group_values_msg = ControlMessage();
-    dynamic_interface_group_values_msg.header.stamp = get_clock()->now();
-    dynamic_interface_group_values_msg.interface_groups.push_back(
-          global_cfg_.gpio_stop_lift_group_name);
-    auto interface_value_msg = control_msgs::msg::InterfaceValue();
-    interface_value_msg.interface_names.push_back(global_cfg_.gpio_stop_lift_ifc_name);
-    interface_value_msg.values.push_back((set)? 1 : 0);
-    dynamic_interface_group_values_msg.interface_values.push_back(interface_value_msg);
-    // Publish the command (RT).
-    rt_pub_gpio_command_->try_publish(dynamic_interface_group_values_msg);
+  if (!rt_pub_stop_lift_) {
+    return;
+  }
+  pending_stop_lift_.store(set ? 1 : 0);
+  publish_pending_stop_lift();
+}
+
+void CubeMarsSystemHardware::publish_pending_stop_lift()
+{
+  const int pending = pending_stop_lift_.load();
+  if (pending < 0 || !rt_pub_stop_lift_) {
+    return;
+  }
+  std_msgs::msg::Bool msg;
+  msg.data = (pending == 1);
+  // Cleared only if no newer request came in meanwhile; otherwise retried next cycle.
+  if (rt_pub_stop_lift_->try_publish(msg)) {
+    int expected = pending;
+    pending_stop_lift_.compare_exchange_strong(expected, -1);
   }
 }
 
